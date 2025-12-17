@@ -1,0 +1,12 @@
+[project]
+name = "cmore-replay"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "matplot>=0.1.9",
+    "mediapipe>=0.10.14",
+    "opencv-contrib-python>=4.12.0.88",
+    "pandas>=2.3.3",
+]
