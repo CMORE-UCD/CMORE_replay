@@ -4,6 +4,7 @@ from mediapipe.framework.formats import landmark_pb2
 import numpy as np
 import cv2 as cv
 import pandas as pd
+import os
 
 MARGIN = 10  # pixels
 FONT_SIZE = 1
@@ -30,6 +31,7 @@ def draw_landmarks_on_image(rgb_image, detection_result):
     rgb_image: Input RGB image
     detection_result: List of hand detections from Vision framework
   """
+  
   annotated_image = np.copy(rgb_image)
   height, width, _ = annotated_image.shape
   
@@ -146,7 +148,7 @@ def draw_cgrect_bboxes(bgr_image, detection, color=(0, 0, 255), thickness=2):
 
     return annotated
 
-def visualize_frame(frame, frameResult):
+def visualize_frame(frame, frameResult: pd.Series):
     """Visualize all detections from a frame result on the input frame.
     
     Args:
@@ -158,26 +160,23 @@ def visualize_frame(frame, frameResult):
     """
     annotated = frame.copy()
     
-    # Get result dictionary
-    result_dict = frameResult.get('result', {})
-    
     # Draw box detection keypoints if present
-    if 'boxDetection' in result_dict and result_dict['boxDetection']:
-        annotated = draw_keypoints_on_image(annotated, result_dict['boxDetection'])
+    if 'boxDetection' in frameResult and frameResult['boxDetection']:
+        annotated = draw_keypoints_on_image(annotated, frameResult['boxDetection'])
     
     # Draw hand landmarks if present
-    if 'hands' in result_dict and result_dict['hands']:
-        annotated = draw_landmarks_on_image(annotated, result_dict['hands'])
+    if 'hands' in frameResult and isinstance(frameResult['hands'], list):
+        annotated = draw_landmarks_on_image(annotated, frameResult['hands'])
     
     # Draw face bounding boxes if present
-    if 'faces' in result_dict and result_dict['faces']:
-        for face in result_dict['faces']:
+    if 'faces' in frameResult and frameResult['faces']:
+        for face in frameResult['faces']:
             if 'boundingBox' in face and face['boundingBox']:
                 annotated = draw_cgrect_bboxes(annotated, face['boundingBox'])
     
     # Draw block detections (ROI and objects) if present
-    if 'blockDetections' in result_dict and result_dict['blockDetections']:
-        for blockDetection in result_dict['blockDetections']:
+    if 'blockDetections' in frameResult and frameResult['blockDetections']:
+        for blockDetection in frameResult['blockDetections']:
             # Draw ROI bounding box
             if 'ROI' in blockDetection and blockDetection['ROI']:
                 annotated = draw_cgrect_bboxes(annotated, blockDetection['ROI'])
@@ -201,16 +200,26 @@ def visualize_frame(frame, frameResult):
                                 roi_crop = annotated[y1:y2, x1:x2].copy()
                                 roi_annotated = draw_cgrect_bboxes(roi_crop, obj['boundingBox'], color=(0, 255, 0))
                                 annotated[y1:y2, x1:x2] = roi_annotated
+    # show the state
+    cv.putText(annotated, f"State: {frameResult['state']}", 
+                    (10, 60), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     
     return annotated
 
 def main():
+    if len(sys.argv) < 2:
+        print("Error: Please provide video file path as command line argument")
+        print("Usage: python main.py <video_path>")
+        sys.exit(1)
+
     # Open video file
-    video_path = sys.argv[1] if len(sys.argv) > 1 else None
+    video_path = sys.argv[1] 
+    
+    timeTag = os.path.basename(video_path).split('_')[2].replace('.MOV','')
 
     # Open up the results
-    df = pd.read_json("CMORE_Results_1765778365.88187_processed.json")
-    timestamps = df['adjustedTimestamp'].to_numpy()
+    df = pd.read_json(f"CMORE_Results_{timeTag}.json")
+    timestamps = df['presentationTime'].to_numpy() * 1000.0
     
     if not video_path:
         print("Error: Please provide video file path as command line argument")
@@ -223,13 +232,13 @@ def main():
         sys.exit(1)
     
     fps = cap.get(cv.CAP_PROP_FPS)
-    tolerance = 1 / fps
-    print(f"Using time tolerance of {tolerance:.3f} s based on FPS {fps}")
+    tolerance = 10 # 1000 / fps
+    print(f"Using time tolerance of {tolerance:.3f}ms")
     frame_count = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
     current_frame = 0
     
     print(f"Video loaded. FPS: {fps}, Total frames: {frame_count}")
-    print("Controls: Arrow Left/Right (±1 frame), W/S (±10 frames), Q (quit)")
+    print("Controls: A/D (±1 frame), W/S (±10 frames), Q (quit)")
     
     while True:
         cap.set(cv.CAP_PROP_POS_FRAMES, current_frame)
@@ -238,16 +247,17 @@ def main():
         if not ret:
             break
         
-        time_ms = cap.get(cv.CAP_PROP_POS_MSEC) / 1000.0
-        cv.putText(frame, f"Time: {time_ms:.6f}s | Frame: {current_frame}", 
+        time_ms = cap.get(cv.CAP_PROP_POS_MSEC)
+        cv.putText(frame, f"Time: {time_ms:.6f}ms | Frame: {current_frame}", 
                     (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        print(f"Frame: {current_frame}, Time: {time_ms:.6f}s")
+        print(f"Frame: {current_frame}, Time: {time_ms:.6f}ms")
 
         # Check if the current frame has detection results (truncate to 2 decimal places)
         # find the index of the match in timestamps
         match_idx = np.where(np.abs(timestamps - time_ms) < tolerance)[0]
         if len(match_idx) > 0:
-            frameResult = df.iloc[match_idx[0] - 2 if match_idx[0] > 1 else match_idx[0]]
+            print("Data frame indices: ", match_idx)
+            frameResult = df.iloc[match_idx[0]]
             frame = visualize_frame(frame, frameResult)
         
         cv.imshow("Video Player", frame)
@@ -255,9 +265,9 @@ def main():
         key = cv.waitKey(0) & 0xFF
         if key == ord('q'):
             break
-        elif key == 81:  # Left arrow
+        elif key == ord('a'): 
             current_frame = max(0, current_frame - 1)
-        elif key == 83:  # Right arrow
+        elif key == ord('d'):  
             current_frame = min(frame_count - 1, current_frame + 1)
         elif key == ord('w'):  # W key
             current_frame = max(0, current_frame - 10)

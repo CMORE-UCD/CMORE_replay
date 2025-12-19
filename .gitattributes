@@ -1,0 +1,6 @@
+CMORE_Results_1765778365.88187.json filter=lfs diff=lfs merge=lfs -text
+CMORE_Results_1765778365.88187_processed.json filter=lfs diff=lfs merge=lfs -text
+examine.ipynb filter=lfs diff=lfs merge=lfs -text
+CMORE_Recording_1765778365.88187.mov filter=lfs diff=lfs merge=lfs -text
+frame_cross.jpg filter=lfs diff=lfs merge=lfs -text
+image.png filter=lfs diff=lfs merge=lfs -text
