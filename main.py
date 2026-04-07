@@ -5,6 +5,7 @@ import numpy as np
 import cv2 as cv
 import pandas as pd
 import os
+from pathlib import Path
 
 MARGIN = 10  # pixels
 FONT_SIZE = 1
@@ -174,32 +175,13 @@ def visualize_frame(frame, frameResult: pd.Series):
             if 'boundingBox' in face and face['boundingBox']:
                 annotated = draw_cgrect_bboxes(annotated, face['boundingBox'])
     
-    # Draw block detections (ROI and objects) if present
+    # Draw block detections if present
     if 'blockDetections' in frameResult and frameResult['blockDetections']:
         for blockDetection in frameResult['blockDetections']:
-            # Draw ROI bounding box
-            if 'ROI' in blockDetection and blockDetection['ROI']:
-                annotated = draw_cgrect_bboxes(annotated, blockDetection['ROI'])
-                
-                # Get ROI coordinates for cropping
-                rect = blockDetection['ROI'].get('cgRect')
-                if rect and len(rect) == 2 and 'objects' in blockDetection:
-                    h_img, w_img, _ = annotated.shape
-                    (x_norm, y_norm), (w_norm, h_norm) = rect
-                    x1 = int(x_norm * w_img)
-                    x2 = int((x_norm + w_norm) * w_img)
-                    y_top_norm = y_norm + h_norm
-                    y1 = int((1 - y_top_norm) * h_img)
-                    y2 = int((1 - y_norm) * h_img)
-                    
-                    # Draw objects within ROI
-                    if blockDetection['objects']:
-                        for obj in blockDetection['objects']:
-                            if obj:  # Check object is not None/empty
-                                # Create a copy of the ROI crop, draw on it, then paste back
-                                roi_crop = annotated[y1:y2, x1:x2].copy()
-                                roi_annotated = draw_cgrect_bboxes(roi_crop, obj['boundingBox'], color=(0, 255, 0))
-                                annotated[y1:y2, x1:x2] = roi_annotated
+            # Draw the bounding boxes
+            annotated = draw_cgrect_bboxes(annotated, blockDetection['boundingBox'], color=(255, 0, 255), thickness=2)
+            
+
     # show the state
     cv.putText(annotated, f"State: {frameResult['state']}", 
                     (10, 60), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
@@ -215,7 +197,7 @@ def main():
     # Open video file
     video_path = sys.argv[1] 
     
-    timeTag = os.path.basename(video_path).split('_')[2].replace('.MOV','')
+    timeTag = Path(video_path).stem.split('_')[2]
 
     # Open up the results
     df = pd.read_json(f"CMORE_Results_{timeTag}.json")
