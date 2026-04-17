@@ -12,6 +12,16 @@ FONT_SIZE = 1
 FONT_THICKNESS = 1
 HANDEDNESS_TEXT_COLOR = (88, 205, 54) # vibrant green
 
+# --- Counter state ---
+counter = 0
+hand_over_line = False
+
+# Delimiter line state: two (pixel) endpoints, and which x-side triggers a crossing.
+# delimiter_line = (pt_left, pt_right) where each pt is (x, y) in pixel coords.
+# delimiter_side = 'right' | 'left'  — the side a block must cross INTO to count.
+delimiter_line = None
+delimiter_side = None
+
 # Mapping from Vision framework joint names to MediaPipe landmark indices
 VISION_TO_MEDIAPIPE = {
     'wrist': 0,
@@ -23,6 +33,93 @@ VISION_TO_MEDIAPIPE = {
     # Vision uses thumbMP instead of thumbMCP
     'thumbMP': 2
 }
+
+def compute_delimiter_from_box(box_detection, img_width, img_height):
+    """Compute the delimiter line from the boxDetection keypoints.
+
+    Takes the three highest keypoints (lowest pixel y-value = highest on screen
+    after the Vision y-flip), computes the segment between the bottom two of that
+    trio, then splits it at the x-coordinate of the topmost point.  Returns
+    (pt_left, pt_right) in pixel coords — the half-segment on the side selected
+    by `delimiter_side`, i.e. the two endpoints of the delimiter.
+
+    The returned line is always stored globally; call this once when the box is
+    first detected.
+
+    Args:
+        box_detection: dict with 'keypoints' list; each keypoint has
+                       'position' [x, y] in pixels (Vision y-axis, not flipped yet)
+                       and optional 'confidence'.
+        img_width, img_height: frame dimensions in pixels.
+
+    Returns:
+        (pt_left, pt_right): two (x, y) pixel tuples representing the delimiter
+                             segment, or None if fewer than 3 keypoints exist.
+    """
+    keypoints = box_detection.get('keypoints', [])
+    if len(keypoints) < 3:
+        return None
+
+    # Flip y to screen coordinates (same transform used during drawing)
+    pts = []
+    for kp in keypoints:
+        x, y = kp.get('position', [0, 0])
+        y_screen = img_height - y
+        pts.append((x, y_screen))
+
+    
+    top1, pt_left, pt_right = pts[6], pts[8], pts[9]
+
+    # Split the bottom segment at the x-coordinate of the top point
+    split_x = top1[0]
+    # Linearly interpolate y on the segment pt_left→pt_right at x=split_x
+    if pt_right[0] != pt_left[0]:
+        t = (split_x - pt_left[0]) / (pt_right[0] - pt_left[0])
+        split_y = pt_left[1] + t * (pt_right[1] - pt_left[1])
+    else:
+        split_y = (pt_left[1] + pt_right[1]) / 2.0
+    split_pt = (split_x, split_y)
+
+    # Choose the half according to delimiter_side
+    global delimiter_side
+    if delimiter_side == 'right':
+        # Right half: split_pt → pt_right
+        return (split_pt, pt_right)
+    else:
+        # Left half (default): pt_left → split_pt
+        return (pt_left, split_pt)
+
+
+def rect_crosses_delimiter(cgRect, img_width, img_height):
+    """Return True if a cgRect bounding box overlaps the x-range of the delimiter line.
+
+    We only check the horizontal (x-axis) extent of the block against the
+    x-span of the delimiter segment, consistent with the spec.
+
+    Args:
+        cgRect: [[x_norm, y_norm], [w_norm, h_norm]] — normalized Vision coords.
+        img_width, img_height: frame dimensions.
+
+    Returns:
+        bool
+    """
+    global delimiter_line
+    if delimiter_line is None:
+        return False
+
+    (x_norm, y_norm), (w_norm, h_norm) = cgRect
+    block_x1 = x_norm * img_width
+    block_x2 = (x_norm + w_norm) * img_width
+    block_y_top_norm = y_norm + h_norm
+    block_y1 = int((1 - block_y_top_norm) * img_height)
+    block_y2 = int((1 - y_norm) * img_height)
+
+    seg_x1 = min(delimiter_line[0][0], delimiter_line[1][0])
+    seg_x2 = max(delimiter_line[0][0], delimiter_line[1][0])
+    seg_y = min(delimiter_line[0][1], delimiter_line[1][1])
+
+    # Overlap when intervals intersect
+    return block_x1 <= seg_x2 and block_x2 >= seg_x1 and block_y1 <= seg_y <= block_y2
 
 def draw_landmarks_on_image(rgb_image, detection_result):
   """
@@ -149,8 +246,23 @@ def draw_cgrect_bboxes(bgr_image, detection, color=(0, 0, 255), thickness=2):
 
     return annotated
 
+
+def draw_delimiter_line(bgr_image):
+    """Overlay the computed delimiter line segment on the frame."""
+    global delimiter_line
+    if delimiter_line is None:
+        return bgr_image
+    annotated = bgr_image.copy()
+    pt1 = (int(delimiter_line[0][0]), int(delimiter_line[0][1]))
+    pt2 = (int(delimiter_line[1][0]), int(delimiter_line[1][1]))
+    cv.line(annotated, pt1, pt2, (0, 255, 255), 2)  # yellow line
+    return annotated
+
+
 def visualize_frame(frame, frameResult: pd.Series):
     """Visualize all detections from a frame result on the input frame.
+    
+    Also updates the crossing counter based on blockDetections vs the delimiter line.
     
     Args:
         frame: BGR image from OpenCV
@@ -159,103 +271,125 @@ def visualize_frame(frame, frameResult: pd.Series):
     Returns:
         Annotated BGR image with all detections drawn
     """
+    global counter, hand_over_line, delimiter_line, delimiter_side
+
     annotated = frame.copy()
-    
-    # Draw box detection keypoints if present
+    height, width, _ = annotated.shape
+
+    # --- Build / refresh the delimiter line from boxDetection keypoints ---
     if 'boxDetection' in frameResult and frameResult['boxDetection']:
-        annotated = draw_keypoints_on_image(annotated, frameResult['boxDetection'])
-    
-    # Draw hand landmarks if present
+        box = frameResult['boxDetection']
+        annotated = draw_keypoints_on_image(annotated, box)
+        if delimiter_line is None:
+            # Compute for the first time
+            delimiter_line = compute_delimiter_from_box(box, width, height)
+
+    # --- Draw hand landmarks ---
     if 'hands' in frameResult and isinstance(frameResult['hands'], list):
         annotated = draw_landmarks_on_image(annotated, frameResult['hands'])
-    
-    # Draw face bounding boxes if present
+
+    # --- Draw face bounding boxes ---
     if 'faces' in frameResult and frameResult['faces']:
         for face in frameResult['faces']:
             if 'boundingBox' in face and face['boundingBox']:
                 annotated = draw_cgrect_bboxes(annotated, face['boundingBox'])
-    
-    # Draw block detections if present
+
+    # --- Draw block detections and update counter ---
+    block_crosses = False
     if 'blockDetections' in frameResult and frameResult['blockDetections']:
         for blockDetection in frameResult['blockDetections']:
-            # Draw the bounding boxes
-            annotated = draw_cgrect_bboxes(annotated, blockDetection['boundingBox'], color=(255, 0, 255), thickness=2)
-            
+            annotated = draw_cgrect_bboxes(annotated, blockDetection['boundingBox'],
+                                           color=(255, 0, 255), thickness=2)
+            rect = blockDetection['boundingBox'].get('cgRect')
+            if rect and rect_crosses_delimiter(rect, width, height):
+                block_crosses = True
 
-    # show the state
-    cv.putText(annotated, f"State: {frameResult['state']}", 
-                    (10, 60), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    
+    # Counter logic:
+    # Increment when a block first crosses the delimiter (hand_over_line was False).
+    # Reset hand_over_line when no hand landmark x is inside the delimiter x-range.
+    if block_crosses and not hand_over_line:
+        counter += 1
+        hand_over_line = True
+    elif hand_over_line and not frameResult['state'] == 'crossed':
+        hand_over_line = False
+
+    # --- Draw delimiter line ---
+    annotated = draw_delimiter_line(annotated)
+
     return annotated
 
 def main():
     if len(sys.argv) < 2:
         print("Error: Please provide video file path as command line argument")
-        print("Usage: python main.py <video_path>")
+        print("Usage: uv run ./main.py <video_path>")
         sys.exit(1)
 
+    global delimiter_side
+    delimiter_side = 'right'  # default: hand moving left→right
+
     # Open video file
-    video_path = sys.argv[1] 
-    
+    video_path = sys.argv[1]
+
     timeTag = Path(video_path).stem.split('_')[2]
 
     # Open up the results
     df = pd.read_json(f"CMORE_Results_{timeTag}.json")
     timestamps = df['presentationTime'].to_numpy() * 1000.0
-    
-    if not video_path:
-        print("Error: Please provide video file path as command line argument")
-        print("Usage: python main.py <video_path>")
-        sys.exit(1)
+
     cap = cv.VideoCapture(video_path)
-    
+
     if not cap.isOpened():
         print("Error: Could not open video file")
         sys.exit(1)
-    
+
     fps = cap.get(cv.CAP_PROP_FPS)
     tolerance = 10 # 1000 / fps
     print(f"Using time tolerance of {tolerance:.3f}ms")
     frame_count = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
     current_frame = 0
-    
+
     print(f"Video loaded. FPS: {fps}, Total frames: {frame_count}")
     print("Controls: A/D (±1 frame), W/S (±10 frames), Q (quit)")
-    
+
     while True:
         cap.set(cv.CAP_PROP_POS_FRAMES, current_frame)
         ret, frame = cap.read()
-        
+
         if not ret:
             break
-        
+
         time_ms = cap.get(cv.CAP_PROP_POS_MSEC)
-        cv.putText(frame, f"Time: {time_ms:.6f}ms | Frame: {current_frame}", 
-                    (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         print(f"Frame: {current_frame}, Time: {time_ms:.6f}ms")
 
-        # Check if the current frame has detection results (truncate to 2 decimal places)
-        # find the index of the match in timestamps
+        # Apply detections / update counter
+        state_text = ""
         match_idx = np.where(np.abs(timestamps - time_ms) < tolerance)[0]
         if len(match_idx) > 0:
             print("Data frame indices: ", match_idx)
             frameResult = df.iloc[match_idx[0]]
             frame = visualize_frame(frame, frameResult)
-        
+            state_text = f"State: {frameResult['state']}"
+
+        # --- All HUD text drawn here, same position as original Time/Frame line ---
+        cv.putText(frame, f"Time: {time_ms:.6f}ms | Frame: {current_frame} | Counter = {counter}",
+                   (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        if state_text:
+            cv.putText(frame, state_text,
+                       (10, 60), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv.imshow("Video Player", frame)
-        
+
         key = cv.waitKey(0) & 0xFF
         if key == ord('q'):
             break
-        elif key == ord('a'): 
+        elif key == ord('a'):
             current_frame = max(0, current_frame - 1)
-        elif key == ord('d'):  
+        elif key == ord('d'):
             current_frame = min(frame_count - 1, current_frame + 1)
-        elif key == ord('w'):  # W key
+        elif key == ord('w'):
             current_frame = max(0, current_frame - 10)
-        elif key == ord('s'):  # S key
+        elif key == ord('s'):
             current_frame = min(frame_count - 1, current_frame + 10)
-    
+
     cap.release()
     cv.destroyAllWindows()
 
