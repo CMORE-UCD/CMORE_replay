@@ -14,13 +14,13 @@ HANDEDNESS_TEXT_COLOR = (88, 205, 54) # vibrant green
 
 # --- Counter state ---
 counter = 0
-hand_over_line = False
+active_counting_state = False
 
 # Delimiter line state: two (pixel) endpoints, and which x-side triggers a crossing.
-# delimiter_line = (pt_left, pt_right) where each pt is (x, y) in pixel coords.
-# delimiter_side = 'right' | 'left'  — the side a block must cross INTO to count.
-delimiter_line = None
-delimiter_side = None
+# target_zone_pts = (top_left, top_right) where each pt is (x, y) in pixel coords.
+# target_side = 'right' | 'left'  — the side a block must cross INTO to count.
+target_zone_pts = None 
+target_side = None 
 
 # Mapping from Vision framework joint names to MediaPipe landmark indices
 VISION_TO_MEDIAPIPE = {
@@ -34,16 +34,10 @@ VISION_TO_MEDIAPIPE = {
     'thumbMP': 2
 }
 
-def compute_delimiter_from_box(box_detection, img_width, img_height):
-    """Compute the delimiter line from the boxDetection keypoints.
+def compute_target_zone_from_box(box_detection, img_width, img_height):
+    """Computes the target zone, a trapezoidal shape, from keypoints. 
 
-    Takes the three highest keypoints (lowest pixel y-value = highest on screen
-    after the Vision y-flip), computes the segment between the bottom two of that
-    trio, then splits it at the x-coordinate of the topmost point.  Returns
-    (pt_left, pt_right) in pixel coords — the half-segment on the side selected
-    by `delimiter_side`, i.e. the two endpoints of the delimiter.
-
-    The returned line is always stored globally; call this once when the box is
+    The returned lines are always stored globally; call this once when the box is
     first detected.
 
     Args:
@@ -53,7 +47,7 @@ def compute_delimiter_from_box(box_detection, img_width, img_height):
         img_width, img_height: frame dimensions in pixels.
 
     Returns:
-        (pt_left, pt_right): two (x, y) pixel tuples representing the delimiter
+        (top_left, top_right): two (x, y) pixel tuples representing the delimiter
                              segment, or None if fewer than 3 keypoints exist.
     """
     keypoints = box_detection.get('keypoints', [])
@@ -68,33 +62,38 @@ def compute_delimiter_from_box(box_detection, img_width, img_height):
         pts.append((x, y_screen))
 
     
-    top1, pt_left, pt_right = pts[6], pts[8], pts[9]
+    top_middle, top_left, top_right = pts[6], pts[8], pts[9]
+    bottom_left, bottom_right = pts[0], pts[4]
 
     # Split the bottom segment at the x-coordinate of the top point
-    split_x = top1[0]
-    # Linearly interpolate y on the segment pt_left→pt_right at x=split_x
-    if pt_right[0] != pt_left[0]:
-        t = (split_x - pt_left[0]) / (pt_right[0] - pt_left[0])
-        split_y = pt_left[1] + t * (pt_right[1] - pt_left[1])
+    split_x = top_middle[0]
+    # Linearly interpolate y on the segment top_left→top_right at x=split_x
+    if top_right[0] != top_left[0]:
+        t = (split_x - top_left[0]) / (top_right[0] - top_left[0])
+        split_y = top_left[1] + t * (top_right[1] - top_left[1])
     else:
-        split_y = (pt_left[1] + pt_right[1]) / 2.0
+        split_y = (top_left[1] + top_right[1]) / 2.0
     split_pt = (split_x, split_y)
 
-    # Choose the half according to delimiter_side
-    global delimiter_side
-    if delimiter_side == 'right':
-        # Right half: split_pt → pt_right
-        return (split_pt, pt_right)
+    # Choose the half according to target_side
+    global target_side
+    if target_side == 'right':
+        top_left = split_pt
+        bottom_left = pts[2]
     else:
-        # Left half (default): pt_left → split_pt
-        return (pt_left, split_pt)
+        top_right = split_pt
+        bottom_right = pts[2]
+
+    return {
+        "top_left" : top_left,
+        "bottom_left" : bottom_left,
+        "top_right" : top_right,
+        "bottom_right" : bottom_right
+    }
 
 
 def rect_crosses_delimiter(cgRect, img_width, img_height):
-    """Return True if a cgRect bounding box overlaps the x-range of the delimiter line.
-
-    We only check the horizontal (x-axis) extent of the block against the
-    x-span of the delimiter segment, consistent with the spec.
+    """Return True if a cgRect bounding box overlaps the x and y-range of the delimiter line.
 
     Args:
         cgRect: [[x_norm, y_norm], [w_norm, h_norm]] — normalized Vision coords.
@@ -103,8 +102,8 @@ def rect_crosses_delimiter(cgRect, img_width, img_height):
     Returns:
         bool
     """
-    global delimiter_line
-    if delimiter_line is None:
+    global target_zone_pts
+    if target_zone_pts is None:
         return False
 
     (x_norm, y_norm), (w_norm, h_norm) = cgRect
@@ -114,13 +113,13 @@ def rect_crosses_delimiter(cgRect, img_width, img_height):
     block_y1 = int((1 - block_y_top_norm) * img_height)
     block_y2 = int((1 - y_norm) * img_height)
 
-    seg_x1 = min(delimiter_line[0][0], delimiter_line[1][0])
-    seg_x2 = max(delimiter_line[0][0], delimiter_line[1][0])
-    seg_y = min(delimiter_line[0][1], delimiter_line[1][1])
+    target_x1 = min(target_zone_pts["top_left"][0], target_zone_pts["bottom_left"][0])
+    target_x2 = max(target_zone_pts["top_right"][0], target_zone_pts["bottom_right"][0])
+    target_y1 = min(target_zone_pts["top_left"][1], target_zone_pts["top_right"][1])   # topmost screen edge (small y)
+    target_y2 = max(target_zone_pts["bottom_left"][1], target_zone_pts["bottom_right"][1])  # bottommost screen edge (large y)
 
-    # Overlap when intervals intersect
-    return block_x1 <= seg_x2 and block_x2 >= seg_x1 and block_y1 <= seg_y <= block_y2
-
+    # Overlap when both intervals intersect
+    return block_x1 <= target_x2 and block_x2 >= target_x1 and block_y1 <= target_y2 and block_y2 >= target_y1
 def draw_landmarks_on_image(rgb_image, detection_result):
   """
   Draw hand landmarks on image using Vision framework detection results.
@@ -247,15 +246,22 @@ def draw_cgrect_bboxes(bgr_image, detection, color=(0, 0, 255), thickness=2):
     return annotated
 
 
-def draw_delimiter_line(bgr_image):
+def draw_target_zone_lines(bgr_image): 
     """Overlay the computed delimiter line segment on the frame."""
-    global delimiter_line
-    if delimiter_line is None:
+    global target_zone_pts
+    if target_zone_pts is None:
         return bgr_image
     annotated = bgr_image.copy()
-    pt1 = (int(delimiter_line[0][0]), int(delimiter_line[0][1]))
-    pt2 = (int(delimiter_line[1][0]), int(delimiter_line[1][1]))
-    cv.line(annotated, pt1, pt2, (0, 255, 255), 2)  # yellow line
+
+    top_left = (int(target_zone_pts["top_left"][0]), int(target_zone_pts["top_left"][1]))
+    bottom_left = (int(target_zone_pts["bottom_left"][0]), int(target_zone_pts["bottom_left"][1]))
+    top_right = (int(target_zone_pts["top_right"][0]), int(target_zone_pts["top_right"][1]))
+    bottom_right = (int(target_zone_pts["bottom_right"][0]), int(target_zone_pts["bottom_right"][1]))
+
+    cv.line(annotated, top_left, top_right, (0, 255, 255), 2)  # yellow line
+    cv.line(annotated, top_left, bottom_left, (0, 255, 255), 2)  # yellow line
+    cv.line(annotated, top_right, bottom_right, (0, 255, 255), 2)  # yellow line
+    cv.line(annotated, bottom_left, bottom_right, (0, 255, 255), 2)  # yellow line
     return annotated
 
 
@@ -271,7 +277,7 @@ def visualize_frame(frame, frameResult: pd.Series):
     Returns:
         Annotated BGR image with all detections drawn
     """
-    global counter, hand_over_line, delimiter_line, delimiter_side
+    global counter, active_counting_state, target_zone_pts, target_side
 
     annotated = frame.copy()
     height, width, _ = annotated.shape
@@ -280,9 +286,9 @@ def visualize_frame(frame, frameResult: pd.Series):
     if 'boxDetection' in frameResult and frameResult['boxDetection']:
         box = frameResult['boxDetection']
         annotated = draw_keypoints_on_image(annotated, box)
-        if delimiter_line is None:
+        if target_zone_pts is None:
             # Compute for the first time
-            delimiter_line = compute_delimiter_from_box(box, width, height)
+            target_zone_pts = compute_target_zone_from_box(box, width, height)
 
     # --- Draw hand landmarks ---
     if 'hands' in frameResult and isinstance(frameResult['hands'], list):
@@ -305,16 +311,16 @@ def visualize_frame(frame, frameResult: pd.Series):
                 block_crosses = True
 
     # Counter logic:
-    # Increment when a block first crosses the delimiter (hand_over_line was False).
-    # Reset hand_over_line when no hand landmark x is inside the delimiter x-range.
-    if block_crosses and not hand_over_line:
+    # Increment when a block first crosses the delimiter (active_counting_state was False).
+    # Reset active_counting_state when no hand landmark x is inside the delimiter x-range.
+    if block_crosses and not active_counting_state:
         counter += 1
-        hand_over_line = True
-    elif hand_over_line and not frameResult['state'] == 'crossed':
-        hand_over_line = False
+        active_counting_state = True
+    elif active_counting_state and not frameResult['state'] == 'crossed':
+        active_counting_state = False
 
     # --- Draw delimiter line ---
-    annotated = draw_delimiter_line(annotated)
+    annotated = draw_target_zone_lines(annotated)
 
     return annotated
 
@@ -324,8 +330,8 @@ def main():
         print("Usage: uv run ./main.py <video_path>")
         sys.exit(1)
 
-    global delimiter_side
-    delimiter_side = 'right'  # default: hand moving left→right
+    global target_side
+    target_side = 'right'  # default: hand moving left→right
 
     # Open video file
     video_path = sys.argv[1]
