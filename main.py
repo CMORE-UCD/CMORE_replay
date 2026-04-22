@@ -1,4 +1,5 @@
 import sys
+import argparse
 from mediapipe import solutions
 from mediapipe.framework.formats import landmark_pb2
 import numpy as np
@@ -6,6 +7,42 @@ import cv2 as cv
 import pandas as pd
 import os
 from pathlib import Path
+import boxmot
+
+MOTION_TRACKERS = ['bytetrack', 'ocsort', 'sfsort', 'boosttrack']
+
+def make_tracker(name: str, track_buffer: int = 30):
+    """Instantiate a boxmot motion-only tracker by name."""
+    if name == 'bytetrack':
+        return boxmot.ByteTrack(track_buffer=track_buffer)
+    elif name == 'ocsort':
+        return boxmot.OcSort()
+    elif name == 'sfsort':
+        return boxmot.SFSORT()
+    elif name == 'boosttrack':
+        return boxmot.BoostTrack()
+    else:
+        raise ValueError(f"Unknown tracker '{name}'. Choose from: {MOTION_TRACKERS}")
+
+MARGIN = 10  # pixels
+FONT_SIZE = 1
+FONT_THICKNESS = 1
+HANDEDNESS_TEXT_COLOR = (88, 205, 54) # vibrant green
+TRACKER_COLOR = (255, 255, 0)  # cyan for tracker boxes
+
+
+def cgrect_to_norm_xyxy(detection):
+    """Convert a Vision cgRect dict to normalized [x1, y1, x2, y2] (top-left origin)."""
+    rect = detection.get('cgRect')
+    if rect and len(rect) == 2:
+        (x_norm, y_norm), (w_norm, h_norm) = rect
+        x1 = x_norm
+        x2 = x_norm + w_norm
+        y1 = 1.0 - (y_norm + h_norm)  # flip y: Vision bottom-left → top-left
+        y2 = 1.0 - y_norm
+        if w_norm > 0 and h_norm > 0:
+            return [x1, y1, x2, y2]
+    return None
 
 MARGIN = 10  # pixels
 FONT_SIZE = 1
@@ -93,8 +130,20 @@ def compute_target_zone_from_box(box_detection, img_width, img_height):
         "bottom_right" : bottom_right
     }
 
+def trapezoid_polygon():
+    """Return the trapezoid as an ordered numpy contour for cv.pointPolygonTest.
+    Order: top-left → top-right → bottom-right → bottom-left (clockwise).
+    """
+    global target_zone_pts
 
-def rect_crosses_delimiter(cgRect, img_width, img_height):
+    return np.array([
+        target_zone_pts["top_left"],
+        target_zone_pts["top_right"],
+        target_zone_pts["bottom_right"],
+        target_zone_pts["bottom_left"],
+    ], dtype=np.float32)
+
+def block_in_target_zone(cgRect, img_width, img_height):
     """Return True if a cgRect bounding box overlaps the x and y-range of the delimiter line.
 
     Args:
@@ -115,14 +164,21 @@ def rect_crosses_delimiter(cgRect, img_width, img_height):
     block_y1 = int((1 - block_y_top_norm) * img_height)
     block_y2 = int((1 - y_norm) * img_height)
 
-    target_x1 = min(target_zone_pts["top_left"][0], target_zone_pts["bottom_left"][0])
-    target_x2 = max(target_zone_pts["top_right"][0], target_zone_pts["bottom_right"][0])
-    target_y1 = min(target_zone_pts["top_left"][1], target_zone_pts["top_right"][1])   # topmost screen edge (small y)
-    target_y2 = max(target_zone_pts["bottom_left"][1], target_zone_pts["bottom_right"][1])  # bottommost screen edge (large y)
+    poly = trapezoid_polygon()
 
-    # Overlap when both intervals intersect
-    # fix this to check entire trapezoid
-    return block_x1 <= target_x2 and block_x2 >= target_x1 and block_y1 <= target_y2 and block_y2 >= target_y1
+    # Check all four corners of the block bbox
+    corners = [
+        (block_x1, block_y1),  # top-left
+        (block_x2, block_y1),  # top-right
+        (block_x1, block_y2),  # bottom-left
+        (block_x2, block_y2),  # bottom-right
+    ]
+    for pt in corners:
+        # >= 0 means inside or on the edge
+        if cv.pointPolygonTest(poly, pt, measureDist=False) >= 0:
+            return True
+
+    return False
 
 def draw_landmarks_on_image(rgb_image, detection_result):
   """
@@ -269,7 +325,7 @@ def draw_target_zone_lines(bgr_image):
     return annotated
 
 
-def visualize_frame(frame, frameResult: pd.Series):
+def visualize_frame(frame, frameResult: pd.Series, tracked: 'np.ndarray | None' = None):
     """Visualize all detections from a frame result on the input frame.
     
     Also updates the crossing counter based on blockDetections vs the delimiter line.
@@ -304,16 +360,25 @@ def visualize_frame(frame, frameResult: pd.Series):
             if 'boundingBox' in face and face['boundingBox']:
                 annotated = draw_cgrect_bboxes(annotated, face['boundingBox'])
 
-    # --- Draw block detections and update counter ---
-    block_crosses = False
+    # --- Draw block detections and update counter ---\
     cur_detected_in_target = 0
     if 'blockDetections' in frameResult and frameResult['blockDetections']:
         for blockDetection in frameResult['blockDetections']:
             annotated = draw_cgrect_bboxes(annotated, blockDetection['boundingBox'],
                                            color=(255, 0, 255), thickness=2)
             rect = blockDetection['boundingBox'].get('cgRect')
-            if rect and rect_crosses_delimiter(rect, width, height):
+            if rect and block_in_target_zone(rect, width, height):
                 cur_detected_in_target += 1
+
+    # Draw tracker boxes in cyan: columns [x1,y1,x2,y2,track_id,...]
+    if tracked is not None and len(tracked) > 0:
+        for row in tracked:
+            x1, y1, x2, y2, tid = row[0], row[1], row[2], row[3], int(row[4])
+            px1, py1 = int(x1 * width), int(y1 * height)
+            px2, py2 = int(x2 * width), int(y2 * height)
+            cv.rectangle(annotated, (px1, py1), (px2, py2), TRACKER_COLOR, 2)
+            cv.putText(annotated, f"T{tid}", (px1, max(py1 - 6, 10)),
+                       cv.FONT_HERSHEY_SIMPLEX, 0.6, TRACKER_COLOR, 2, cv.LINE_AA)
 
     # Counter logic:
     # Increment when a new block is detected in target zone, and active_counting_state is False
@@ -334,19 +399,15 @@ def visualize_frame(frame, frameResult: pd.Series):
     return annotated
 
 def main():
-    if len(sys.argv) < 2:
-        print("Error: Please provide video file path as command line argument")
-        print("Usage: uv run ./main.py <video_path>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('video_path', help='Path to the video file')
+    parser.add_argument('--tracker', choices=MOTION_TRACKERS, default='bytetrack',
+                        help='Tracker to use (default: bytetrack)')
+    parser.add_argument('--track_buffer', type=int, default=30,
+                        help='Frames to keep a lost track alive (bytetrack only, default: 30)')
+    args = parser.parse_args()
 
-    global target_side
-    target_side = 'right'  # default: hand moving left→right
-
-    global prev_detected_in_target
-    prev_detected_in_target = 0
-
-    # Open video file
-    video_path = sys.argv[1]
+    video_path = args.video_path
 
     timeTag = Path(video_path).stem.split('_')[2]
 
@@ -367,6 +428,34 @@ def main():
     current_frame = 0
 
     print(f"Video loaded. FPS: {fps}, Total frames: {frame_count}")
+
+    global target_side
+    target_side = 'right'  # default: hand moving left→right
+
+    global prev_detected_in_target
+    prev_detected_in_target = 0
+
+    print(f"Pre-computing tracks with {args.tracker}...")
+
+    tracker = make_tracker(args.tracker, args.track_buffer)
+    block_tracked = {}  # df row index -> np.ndarray (n, 8) or None
+    dummy_frame = np.zeros((1, 1, 3), dtype=np.uint8)
+
+    for idx, row in df.iterrows():
+        block_dets = row.get('blockDetections') or []
+        if not isinstance(block_dets, list):
+            block_dets = []
+        boxes = [cgrect_to_norm_xyxy(bd['boundingBox']) for bd in block_dets]
+        valid = [(b, bd) for b, bd in zip(boxes, block_dets) if b is not None]
+        if valid:
+            xyxy = np.array([b for b, _ in valid], dtype=np.float32)
+            conf = np.array([float(bd.get('confidence', 1.0)) for _, bd in valid], dtype=np.float32)
+            cls = np.zeros(len(valid), dtype=np.float32)
+            dets = np.column_stack([xyxy, conf, cls])
+            block_tracked[idx] = tracker.update(dets, dummy_frame)
+        else:
+            block_tracked[idx] = tracker.update(np.empty((0, 6), dtype=np.float32), dummy_frame)
+
     print("Controls: A/D (±1 frame), W/S (±10 frames), Q (quit)")
 
     while True:
@@ -385,7 +474,8 @@ def main():
         if len(match_idx) > 0:
             print("Data frame indices: ", match_idx)
             frameResult = df.iloc[match_idx[0]]
-            frame = visualize_frame(frame, frameResult)
+            tracked = block_tracked.get(match_idx[0])
+            frame = visualize_frame(frame, frameResult, tracked=tracked)
             state_text = f"State: {frameResult['state']}"
 
         # --- All HUD text drawn here, same position as original Time/Frame line ---
