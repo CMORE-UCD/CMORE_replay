@@ -21,6 +21,8 @@ active_counting_state = False
 # target_side = 'right' | 'left'  — the side a block must cross INTO to count.
 target_zone_pts = None 
 target_side = None 
+prev_detected_in_target = None
+crossed_back = False
 
 # Mapping from Vision framework joint names to MediaPipe landmark indices
 VISION_TO_MEDIAPIPE = {
@@ -119,7 +121,9 @@ def rect_crosses_delimiter(cgRect, img_width, img_height):
     target_y2 = max(target_zone_pts["bottom_left"][1], target_zone_pts["bottom_right"][1])  # bottommost screen edge (large y)
 
     # Overlap when both intervals intersect
+    # fix this to check entire trapezoid
     return block_x1 <= target_x2 and block_x2 >= target_x1 and block_y1 <= target_y2 and block_y2 >= target_y1
+
 def draw_landmarks_on_image(rgb_image, detection_result):
   """
   Draw hand landmarks on image using Vision framework detection results.
@@ -277,7 +281,7 @@ def visualize_frame(frame, frameResult: pd.Series):
     Returns:
         Annotated BGR image with all detections drawn
     """
-    global counter, active_counting_state, target_zone_pts, target_side
+    global counter, prev_detected_in_target, crossed_back, active_counting_state, target_zone_pts, target_side
 
     annotated = frame.copy()
     height, width, _ = annotated.shape
@@ -302,23 +306,28 @@ def visualize_frame(frame, frameResult: pd.Series):
 
     # --- Draw block detections and update counter ---
     block_crosses = False
+    cur_detected_in_target = 0
     if 'blockDetections' in frameResult and frameResult['blockDetections']:
         for blockDetection in frameResult['blockDetections']:
             annotated = draw_cgrect_bboxes(annotated, blockDetection['boundingBox'],
                                            color=(255, 0, 255), thickness=2)
             rect = blockDetection['boundingBox'].get('cgRect')
             if rect and rect_crosses_delimiter(rect, width, height):
-                block_crosses = True
+                cur_detected_in_target += 1
 
     # Counter logic:
-    # Increment when a block first crosses the delimiter (active_counting_state was False).
-    # Reset active_counting_state when no hand landmark x is inside the delimiter x-range.
-    if block_crosses and not active_counting_state:
+    # Increment when a new block is detected in target zone, and active_counting_state is False
+    # Reset active_counting_state when hand is detected with new block
+    if cur_detected_in_target > prev_detected_in_target and not active_counting_state:
         counter += 1
         active_counting_state = True
-    elif active_counting_state and not frameResult['state'] == 'crossed':
+        crossed_back = False
+    elif active_counting_state and crossed_back and frameResult['state'] == 'crossed':
         active_counting_state = False
 
+    prev_detected_in_target = cur_detected_in_target
+    if(frameResult['state'] == 'crossedBack'): 
+        crossed_back = True
     # --- Draw delimiter line ---
     annotated = draw_target_zone_lines(annotated)
 
@@ -332,6 +341,9 @@ def main():
 
     global target_side
     target_side = 'right'  # default: hand moving left→right
+
+    global prev_detected_in_target
+    prev_detected_in_target = 0
 
     # Open video file
     video_path = sys.argv[1]
