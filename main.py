@@ -1,4 +1,5 @@
 import sys
+import argparse
 from mediapipe import solutions
 from mediapipe.framework.formats import landmark_pb2
 import numpy as np
@@ -6,7 +7,23 @@ import cv2 as cv
 import pandas as pd
 import os
 from pathlib import Path
-from scipy.optimize import linear_sum_assignment
+import boxmot
+
+MOTION_TRACKERS = ['bytetrack', 'ocsort', 'sfsort', 'boosttrack']
+
+
+def make_tracker(name: str, track_buffer: int = 30):
+    """Instantiate a boxmot motion-only tracker by name."""
+    if name == 'bytetrack':
+        return boxmot.ByteTrack(track_buffer=track_buffer)
+    elif name == 'ocsort':
+        return boxmot.OcSort()
+    elif name == 'sfsort':
+        return boxmot.SFSORT()
+    elif name == 'boosttrack':
+        return boxmot.BoostTrack()
+    else:
+        raise ValueError(f"Unknown tracker '{name}'. Choose from: {MOTION_TRACKERS}")
 
 MARGIN = 10  # pixels
 FONT_SIZE = 1
@@ -15,109 +32,18 @@ HANDEDNESS_TEXT_COLOR = (88, 205, 54) # vibrant green
 TRACKER_COLOR = (255, 255, 0)  # cyan for tracker boxes
 
 
-def cgrect_to_pixel_xywh(detection, w_img, h_img):
-    """Convert a Vision cgRect dict to OpenCV (x, y, w, h) in pixel coords."""
+def cgrect_to_norm_xyxy(detection):
+    """Convert a Vision cgRect dict to normalized [x1, y1, x2, y2] (top-left origin)."""
     rect = detection.get('cgRect')
     if rect and len(rect) == 2:
         (x_norm, y_norm), (w_norm, h_norm) = rect
-        x = int(x_norm * w_img)
-        y = int((1 - (y_norm + h_norm)) * h_img)
-        w = int(w_norm * w_img)
-        h = int(h_norm * h_img)
-        if w > 0 and h > 0:
-            return (x, y, w, h)
+        x1 = x_norm
+        x2 = x_norm + w_norm
+        y1 = 1.0 - (y_norm + h_norm)  # flip y: Vision bottom-left → top-left
+        y2 = 1.0 - y_norm
+        if w_norm > 0 and h_norm > 0:
+            return [x1, y1, x2, y2]
     return None
-
-
-def compute_iou_matrix(boxes_a, boxes_b):
-    """Compute IoU matrix between two lists of [x1, y1, x2, y2] boxes."""
-    iou = np.zeros((len(boxes_a), len(boxes_b)), dtype=np.float32)
-    for i, a in enumerate(boxes_a):
-        for j, b in enumerate(boxes_b):
-            xi1 = max(a[0], b[0]); yi1 = max(a[1], b[1])
-            xi2 = min(a[2], b[2]); yi2 = min(a[3], b[3])
-            inter = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-            area_a = (a[2] - a[0]) * (a[3] - a[1])
-            area_b = (b[2] - b[0]) * (b[3] - b[1])
-            union = area_a + area_b - inter
-            iou[i, j] = inter / union if union > 0 else 0
-    return iou
-
-
-class OpenCVMultiTracker:
-    """Manages one cv.TrackerCSRT per live track, matched to detections via IoU."""
-
-    def __init__(self, iou_threshold=0.3):
-        self.tracks = {}  # track_id -> {'tracker', 'bbox_xywh'}
-        self.next_id = 1
-        self.iou_threshold = iou_threshold
-
-    def _xywh_to_xyxy(self, xywh):
-        x, y, w, h = xywh
-        return [x, y, x + w, y + h]
-
-    def update(self, frame, det_xywh_list):
-        """
-        Args:
-            frame: BGR image
-            det_xywh_list: list of (x, y, w, h) detections in pixel coords
-        Returns:
-            (track_ids, tracker_bboxes, coasting) where track_ids and tracker_bboxes
-            are aligned to det_xywh_list, and coasting is {track_id: (x,y,w,h)} for
-            tracks still alive but unmatched this frame.
-        """
-        # Step 1: update existing trackers; drop only if CSRT itself fails
-        predicted = {}  # track_id -> [x1, y1, x2, y2]
-        for tid, track in list(self.tracks.items()):
-            success, bbox = track['tracker'].update(frame)
-            if success:
-                predicted[tid] = self._xywh_to_xyxy(bbox)
-            else:
-                del self.tracks[tid]
-
-        # Step 2: match predictions to current detections via IoU
-        track_ids_ordered = list(predicted.keys())
-        det_xyxy_list = [self._xywh_to_xyxy(d) for d in det_xywh_list]
-
-        matched_det_to_track = {}  # det_idx -> track_id
-        if track_ids_ordered and det_xywh_list:
-            pred_boxes = [predicted[tid] for tid in track_ids_ordered]
-            iou_mat = compute_iou_matrix(pred_boxes, det_xyxy_list)
-            row_ind, col_ind = linear_sum_assignment(-iou_mat)
-            for r, c in zip(row_ind, col_ind):
-                if iou_mat[r, c] >= self.iou_threshold:
-                    matched_det_to_track[c] = track_ids_ordered[r]
-
-        # Step 3: build output; re-init matched trackers on detection bbox
-        result_ids = []
-        result_bboxes = []
-        matched_track_ids = set()
-        for det_idx, det_xywh in enumerate(det_xywh_list):
-            if det_idx in matched_det_to_track:
-                tid = matched_det_to_track[det_idx]
-                matched_track_ids.add(tid)
-                self.tracks[tid]['tracker'].init(frame, det_xywh)
-                self.tracks[tid]['bbox_xywh'] = det_xywh
-                result_ids.append(tid)
-                result_bboxes.append(det_xywh)
-            else:
-                # New track
-                tracker = cv.TrackerCSRT_create()
-                tracker.init(frame, det_xywh)
-                self.tracks[self.next_id] = {'tracker': tracker, 'bbox_xywh': det_xywh}
-                result_ids.append(self.next_id)
-                result_bboxes.append(det_xywh)
-                self.next_id += 1
-
-        # Step 4: collect coasting tracks (unmatched but still tracked by CSRT)
-        coasting = {}  # track_id -> (x, y, w, h) CSRT-predicted bbox
-        for tid in self.tracks.keys():
-            if tid not in matched_track_ids:
-                if tid in predicted:
-                    x1, y1, x2, y2 = predicted[tid]
-                    coasting[tid] = (int(x1), int(y1), int(x2 - x1), int(y2 - y1))
-
-        return result_ids, result_bboxes, coasting
 
 # Mapping from Vision framework joint names to MediaPipe landmark indices
 VISION_TO_MEDIAPIPE = {
@@ -256,20 +182,19 @@ def draw_cgrect_bboxes(bgr_image, detection, color=(0, 0, 255), thickness=2):
 
     return annotated
 
-def visualize_frame(frame, frameResult: pd.Series, track_ids=None, tracker_bboxes=None, coasting=None):
+def visualize_frame(frame, frameResult: pd.Series, tracked: 'np.ndarray | None' = None):
     """Visualize all detections from a frame result on the input frame.
 
     Args:
         frame: BGR image from OpenCV
         frameResult: Detection result dictionary containing hands, faces, boxDetection, blockDetections
-        track_ids: list of int track IDs aligned to blockDetections
-        tracker_bboxes: list of (x, y, w, h) tracker bboxes in pixel coords, aligned to blockDetections
-        coasting: dict of {track_id: (x, y, w, h)} for tracks still alive but unmatched this frame
+        tracked: boxmot output array (n, 8) [x1,y1,x2,y2,track_id,conf,cls,det_idx] in normalized coords
 
     Returns:
         Annotated BGR image with all detections drawn
     """
     annotated = frame.copy()
+    h_img, w_img = annotated.shape[:2]
 
     # Draw box detection keypoints if present
     if 'boxDetection' in frameResult and frameResult['boxDetection']:
@@ -285,25 +210,20 @@ def visualize_frame(frame, frameResult: pd.Series, track_ids=None, tracker_bboxe
             if 'boundingBox' in face and face['boundingBox']:
                 annotated = draw_cgrect_bboxes(annotated, face['boundingBox'])
 
-    # Draw block detections if present
+    # Draw block detections in magenta
     if 'blockDetections' in frameResult and frameResult['blockDetections']:
-        for i, blockDetection in enumerate(frameResult['blockDetections']):
-            # Draw the detection bounding box in magenta
+        for blockDetection in frameResult['blockDetections']:
             annotated = draw_cgrect_bboxes(annotated, blockDetection['boundingBox'], color=(255, 0, 255), thickness=2)
-            # Draw tracker bbox and ID in cyan
-            if track_ids and tracker_bboxes and i < len(track_ids):
-                tid = track_ids[i]
-                x, y, w, h = tracker_bboxes[i]
-                cv.rectangle(annotated, (x, y), (x + w, y + h), TRACKER_COLOR, 2)
-                cv.putText(annotated, f"T{tid}", (x, max(y - 6, 10)),
-                           cv.FONT_HERSHEY_SIMPLEX, 0.6, TRACKER_COLOR, 2, cv.LINE_AA)
 
-    # Draw coasting tracks (alive in tracker but no detection match this frame) in orange
-    if coasting:
-        for tid, (x, y, w, h) in coasting.items():
-            cv.rectangle(annotated, (x, y), (x + w, y + h), (0, 165, 255), 2)
-            cv.putText(annotated, f"T{tid}", (x, max(y - 6, 10)),
-                       cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2, cv.LINE_AA)
+    # Draw tracker boxes in cyan: columns [x1,y1,x2,y2,track_id,...]
+    if tracked is not None and len(tracked) > 0:
+        for row in tracked:
+            x1, y1, x2, y2, tid = row[0], row[1], row[2], row[3], int(row[4])
+            px1, py1 = int(x1 * w_img), int(y1 * h_img)
+            px2, py2 = int(x2 * w_img), int(y2 * h_img)
+            cv.rectangle(annotated, (px1, py1), (px2, py2), TRACKER_COLOR, 2)
+            cv.putText(annotated, f"T{tid}", (px1, max(py1 - 6, 10)),
+                       cv.FONT_HERSHEY_SIMPLEX, 0.6, TRACKER_COLOR, 2, cv.LINE_AA)
 
     # show the state
     cv.putText(annotated, f"State: {frameResult['state']}",
@@ -312,24 +232,20 @@ def visualize_frame(frame, frameResult: pd.Series, track_ids=None, tracker_bboxe
     return annotated
 
 def main():
-    if len(sys.argv) < 2:
-        print("Error: Please provide video file path as command line argument")
-        print("Usage: python main.py <video_path>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('video_path', help='Path to the video file')
+    parser.add_argument('--tracker', choices=MOTION_TRACKERS, default='bytetrack',
+                        help='Tracker to use (default: bytetrack)')
+    parser.add_argument('--track_buffer', type=int, default=30,
+                        help='Frames to keep a lost track alive (bytetrack only, default: 30)')
+    args = parser.parse_args()
 
-    # Open video file
-    video_path = sys.argv[1] 
-    
+    video_path = args.video_path
     timeTag = Path(video_path).stem.split('_')[2]
 
-    # Open up the results
     df = pd.read_json(f"CMORE_Results_{timeTag}.json")
     timestamps = df['presentationTime'].to_numpy() * 1000.0
-    
-    if not video_path:
-        print("Error: Please provide video file path as command line argument")
-        print("Usage: python main.py <video_path>")
-        sys.exit(1)
+
     cap = cv.VideoCapture(video_path)
     
     if not cap.isOpened():
@@ -343,42 +259,30 @@ def main():
     current_frame = 0
 
     print(f"Video loaded. FPS: {fps}, Total frames: {frame_count}")
-    print("Controls: A/D (±1 frame), Q (quit)")
+    print(f"Pre-computing tracks with {args.tracker}...")
 
-    tracker = OpenCVMultiTracker()
-    block_track_ids = {}      # df row index -> list[int]
-    block_tracker_bboxes = {} # df row index -> list[(x,y,w,h)]
-    block_coasting = {}       # df row index -> {track_id: (x,y,w,h)}
-    frame_coasting = {}       # video frame index -> {track_id: (x,y,w,h)} for frames with no detection
-    tracker_last_frame = -1   # tracker has been updated up to this video frame index
+    tracker = make_tracker(args.tracker, args.track_buffer)
+    block_tracked = {}  # df row index -> np.ndarray (n, 8) or None
+    dummy_frame = np.zeros((1, 1, 3), dtype=np.uint8)
+
+    for idx, row in df.iterrows():
+        block_dets = row.get('blockDetections') or []
+        if not isinstance(block_dets, list):
+            block_dets = []
+        boxes = [cgrect_to_norm_xyxy(bd['boundingBox']) for bd in block_dets]
+        valid = [(b, bd) for b, bd in zip(boxes, block_dets) if b is not None]
+        if valid:
+            xyxy = np.array([b for b, _ in valid], dtype=np.float32)
+            conf = np.array([float(bd.get('confidence', 1.0)) for _, bd in valid], dtype=np.float32)
+            cls = np.zeros(len(valid), dtype=np.float32)
+            dets = np.column_stack([xyxy, conf, cls])
+            block_tracked[idx] = tracker.update(dets, dummy_frame)
+        else:
+            block_tracked[idx] = tracker.update(np.empty((0, 6), dtype=np.float32), dummy_frame)
+
+    print(f"Done. Controls: A/D (±1 frame), W/S (±10 frames), Q (quit)")
 
     while True:
-        # Advance tracker forward to current_frame if not yet computed (cache miss going forward)
-        if current_frame > tracker_last_frame:
-            for fi in range(tracker_last_frame + 1, current_frame + 1):
-                cap.set(cv.CAP_PROP_POS_FRAMES, fi)
-                ret_t, frame_t = cap.read()
-                if not ret_t:
-                    break
-                h_t, w_t = frame_t.shape[:2]
-                t_ms = cap.get(cv.CAP_PROP_POS_MSEC)
-                mi = np.where(np.abs(timestamps - t_ms) < tolerance)[0]
-                if len(mi) > 0:
-                    row = df.iloc[mi[0]]
-                    block_dets = row.get('blockDetections') or []
-                    if not isinstance(block_dets, list):
-                        block_dets = []
-                    xywh_list = [cgrect_to_pixel_xywh(bd['boundingBox'], w_t, h_t) for bd in block_dets]
-                    xywh_list = [b for b in xywh_list if b is not None]
-                    ids, tr_bboxes, coasting = tracker.update(frame_t, xywh_list)
-                    block_track_ids[mi[0]] = ids
-                    block_tracker_bboxes[mi[0]] = tr_bboxes
-                    block_coasting[mi[0]] = coasting
-                else:
-                    _, _, coasting = tracker.update(frame_t, [])
-                    frame_coasting[fi] = coasting
-                tracker_last_frame = fi
-
         cap.set(cv.CAP_PROP_POS_FRAMES, current_frame)
         ret, frame = cap.read()
 
@@ -395,17 +299,8 @@ def main():
         if len(match_idx) > 0:
             print("Data frame indices: ", match_idx)
             frameResult = df.iloc[match_idx[0]]
-            ids = block_track_ids.get(match_idx[0], [])
-            tr_bboxes = block_tracker_bboxes.get(match_idx[0], [])
-            coasting = block_coasting.get(match_idx[0], {})
-            frame = visualize_frame(frame, frameResult, track_ids=ids, tracker_bboxes=tr_bboxes, coasting=coasting)
-        else:
-            # No detection data for this frame — draw any coasting tracks directly
-            coasting = frame_coasting.get(current_frame, {})
-            for tid, (x, y, w, h) in coasting.items():
-                cv.rectangle(frame, (x, y), (x + w, y + h), TRACKER_COLOR, 2)
-                cv.putText(frame, f"T{tid}", (x, max(y - 6, 10)),
-                           cv.FONT_HERSHEY_SIMPLEX, 0.6, TRACKER_COLOR, 2, cv.LINE_AA)
+            tracked = block_tracked.get(match_idx[0])
+            frame = visualize_frame(frame, frameResult, tracked=tracked)
         
         cv.imshow("Video Player", frame)
         
