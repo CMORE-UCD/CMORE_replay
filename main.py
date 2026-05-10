@@ -8,6 +8,19 @@ import pandas as pd
 import os
 from pathlib import Path
 import boxmot
+from dataclasses import dataclass, field
+
+# --- Block tracking struct ---
+@dataclass
+class Block:
+    id: int
+    last5box: list = field(default_factory=list)  # up to 5 [x1,y1,x2,y2] normalized bboxes
+
+    def update(self, bbox_norm):
+        """Append a new normalized [x1,y1,x2,y2] bbox, keeping only the last 5."""
+        self.last5box.append(bbox_norm)
+        if len(self.last5box) > 5:
+            self.last5box.pop(0)
 
 MOTION_TRACKERS = ['bytetrack', 'ocsort', 'sfsort', 'boosttrack']
 
@@ -29,6 +42,7 @@ FONT_SIZE = 1
 FONT_THICKNESS = 1
 HANDEDNESS_TEXT_COLOR = (88, 205, 54) # vibrant green
 TRACKER_COLOR = (255, 255, 0)  # cyan for tracker boxes
+COUNTER_COLOR = (138,43,226) # violet for counting boxes
 
 
 def cgrect_to_norm_xyxy(detection):
@@ -60,6 +74,8 @@ target_zone_pts = None
 target_side = None 
 prev_detected_in_target = None
 crossed_back = False
+counted_ids = set()
+target_block_registry: dict[int, Block] = {}   # track_id -> Block
 
 # Mapping from Vision framework joint names to MediaPipe landmark indices
 VISION_TO_MEDIAPIPE = {
@@ -179,6 +195,38 @@ def block_in_target_zone(cgRect, img_width, img_height):
             return True
 
     return False
+
+def tracker_block_in_target_zone(scaled_norm):
+    """Return True if a cgRect bounding box overlaps the x and y-range of the delimiter line.
+
+    Args:
+        scaled_norm: [px1, py1, px2, py2] — normalized and scaled Vision coord.
+
+    Returns:
+        bool
+    """
+    global target_zone_pts
+    if target_zone_pts is None:
+        return False
+
+    block_x1, block_y1, block_x2, block_y2 = scaled_norm
+
+    poly = trapezoid_polygon()
+
+    # Check all four corners of the block bbox
+    corners = [
+        (block_x1, block_y1),  # top-left
+        (block_x2, block_y1),  # top-right
+        (block_x1, block_y2),  # bottom-left
+        (block_x2, block_y2),  # bottom-right
+    ]
+    for pt in corners:
+        # >= 0 means inside or on the edge
+        if cv.pointPolygonTest(poly, pt, measureDist=False) >= 0:
+            return True
+
+    return False
+
 
 def draw_landmarks_on_image(rgb_image, detection_result):
   """
@@ -305,6 +353,39 @@ def draw_cgrect_bboxes(bgr_image, detection, color=(0, 0, 255), thickness=2):
 
     return annotated
 
+def has_movement(block: Block, threshold: float = 0.25) -> bool:
+    """Return True if the block's center has moved by at least `threshold` fraction
+    of the bbox dimensions across its last-5 history.
+
+    Movement is measured as the Chebyshev-style max displacement of the center
+    relative to the mean bbox size (width or height), so the threshold is
+    scale-invariant.
+
+    Args:
+        block:     Block instance with last5box entries [x1, y1, x2, y2] normalized.
+        threshold: Minimum fractional displacement to count as movement (default 0.25).
+
+    Returns:
+        bool
+    """
+    if len(block.last5box) < 2:
+        return False
+
+    centers = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in block.last5box]
+    sizes   = [(b[2] - b[0], b[3] - b[1]) for b in block.last5box]
+
+    mean_w = sum(s[0] for s in sizes) / len(sizes)
+    mean_h = sum(s[1] for s in sizes) / len(sizes)
+    ref    = max(mean_w, mean_h)  # single scale reference
+
+    if ref == 0:
+        return False
+
+    first_cx, first_cy = centers[0]
+    last_cx,  last_cy  = centers[-1]
+
+    displacement = ((last_cx - first_cx) ** 2 + (last_cy - first_cy) ** 2) ** 0.5
+    return 1 >= (displacement / ref) >= threshold
 
 def draw_target_zone_lines(bgr_image): 
     """Overlay the computed delimiter line segment on the frame."""
@@ -337,7 +418,7 @@ def visualize_frame(frame, frameResult: pd.Series, tracked: 'np.ndarray | None' 
     Returns:
         Annotated BGR image with all detections drawn
     """
-    global counter, prev_detected_in_target, crossed_back, active_counting_state, target_zone_pts, target_side
+    global counter, prev_detected_in_target, target_block_registry, crossed_back, active_counting_state, target_zone_pts, target_side
 
     annotated = frame.copy()
     height, width, _ = annotated.shape
@@ -372,27 +453,53 @@ def visualize_frame(frame, frameResult: pd.Series, tracked: 'np.ndarray | None' 
 
     # Draw tracker boxes in cyan: columns [x1,y1,x2,y2,track_id,...]
     if tracked is not None and len(tracked) > 0:
+        curr_target_tids = set()
         for row in tracked:
             x1, y1, x2, y2, tid = row[0], row[1], row[2], row[3], int(row[4])
             px1, py1 = int(x1 * width), int(y1 * height)
             px2, py2 = int(x2 * width), int(y2 * height)
+
+            if tracker_block_in_target_zone([px1, py1, px2, py2]):
+                curr_target_tids.add(tid)
+                if tid not in target_block_registry:
+                    target_block_registry[tid] = Block(id=tid)
+
+                target_block_registry[tid].update([x1, y1, x2, y2])
+                
             cv.rectangle(annotated, (px1, py1), (px2, py2), TRACKER_COLOR, 2)
             cv.putText(annotated, f"T{tid}", (px1, max(py1 - 6, 10)),
                        cv.FONT_HERSHEY_SIMPLEX, 0.6, TRACKER_COLOR, 2, cv.LINE_AA)
+        
+        for tid in target_block_registry:
+            if tid not in curr_target_tids:
+                target_block_registry[tid].update([0, 0, 0, 0])
 
-    # Counter logic:
-    # Increment when a new block is detected in target zone, and active_counting_state is False
-    # Reset active_counting_state when hand is detected with new block
-    if cur_detected_in_target > prev_detected_in_target and not active_counting_state:
+    # --- NEW Counter logic ---
+
+    for tid, blk in target_block_registry.items():
+        if active_counting_state:
+            continue
+        if not has_movement(blk):
+            continue
+        if tid in counted_ids:
+            continue
         counter += 1
+        counted_ids.add(tid)
+        x1, y1, x2, y2 = blk.last5box[-1]
+        cv.rectangle(annotated, (int(x1 * width), int(y1 * height)), 
+            (int(x2 * width), int(y2 * height)), COUNTER_COLOR, 2)
+        cv.putText(annotated, f"T{tid}", (int(x1 * width), max(int(y1 * height) - 6, 10)),
+            cv.FONT_HERSHEY_SIMPLEX, 0.6, COUNTER_COLOR, 2, cv.LINE_AA)
         active_counting_state = True
         crossed_back = False
-    elif active_counting_state and crossed_back and frameResult['state'] == 'crossed':
+
+    # Reset active_counting_state when crossed_back and state is "crossed"
+    if active_counting_state and crossed_back and frameResult['state'] == 'crossed':
         active_counting_state = False
 
-    prev_detected_in_target = cur_detected_in_target
-    if(frameResult['state'] == 'crossedBack'): 
+    if frameResult['state'] == 'crossedBack':
         crossed_back = True
+
     # --- Draw delimiter line ---
     annotated = draw_target_zone_lines(annotated)
 
