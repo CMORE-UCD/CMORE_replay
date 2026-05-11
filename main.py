@@ -23,6 +23,115 @@ class Block:
             self.last5box.pop(0)
 
 MOTION_TRACKERS = ['bytetrack', 'ocsort', 'sfsort', 'boosttrack']
+MODES = ['manual', 'automatic', 'test']
+
+class Counter:
+    counter = 0
+    height = 0
+    width = 0
+    active_counting_state = False
+    crossed_back = False
+    counted_ids = set()
+    curr_target_tids = set()
+    coords_last_block = []
+    target_block_registry: dict[int, Block] = {}   # track_id -> Block
+
+    def __init__(self): 
+        pass
+
+    def has_movement(self, block: Block, threshold: float = 0.25) -> bool:
+        """Return True if the block's center has moved by at least `threshold` fraction
+        of the bbox dimensions across its last-5 history.
+
+        Movement is measured as the Chebyshev-style max displacement of the center
+        relative to the mean bbox size (width or height), so the threshold is
+        scale-invariant.
+
+        Args:
+            block:     Block instance with last5box entries [x1, y1, x2, y2] normalized.
+            threshold: Minimum fractional displacement to count as movement (default 0.25).
+
+        Returns:
+            bool
+        """
+        if len(block.last5box) < 2:
+            return False
+
+        centers = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in block.last5box]
+        sizes   = [(b[2] - b[0], b[3] - b[1]) for b in block.last5box]
+
+        mean_w = sum(s[0] for s in sizes) / len(sizes)
+        mean_h = sum(s[1] for s in sizes) / len(sizes)
+        ref    = max(mean_w, mean_h)  # single scale reference
+
+        if ref == 0:
+            return False
+
+        first_cx, first_cy = centers[0]
+        last_cx,  last_cy  = centers[-1]
+
+        displacement = ((last_cx - first_cx) ** 2 + (last_cy - first_cy) ** 2) ** 0.5
+        return 1 >= (displacement / ref) >= threshold
+    
+    def update_curr_blocks_in_target(self, tracked: 'np.ndarray | None' = None):
+        if tracked is not None and len(tracked) > 0:
+            for row in tracked:
+                x1, y1, x2, y2, tid = row[0], row[1], row[2], row[3], int(row[4])
+                px1, py1 = int(x1 * self.width), int(y1 * self.height)
+                px2, py2 = int(x2 * self.width), int(y2 * self.height)
+
+                if tracker_block_in_target_zone([px1, py1, px2, py2]):
+                    self.curr_target_tids.add(tid)
+
+                    if tid not in self.target_block_registry:
+                        self.target_block_registry[tid] = Block(id=tid)
+                    
+                    self.target_block_registry[tid].update([x1, y1, x2, y2])
+
+    def update_prev_blocks_in_target(self):
+        for tid in self.target_block_registry:
+            if tid not in self.curr_target_tids:
+                self.target_block_registry[tid].update([0, 0, 0, 0])
+        
+        self.curr_target_tids.clear()
+
+    def update_counter(self):
+        counter_changed = False
+        for tid, blk in self.target_block_registry.items():
+            if self.active_counting_state:
+                continue
+            if not self.has_movement(blk):
+                continue
+            if tid in self.counted_ids:
+                continue
+
+            counter_changed = True
+            self.counter += 1
+            self.counted_ids.add(tid)
+            self.coords_last_block = blk.last5box[-1]
+            self.active_counting_state = True
+            self.crossed_back = False
+        
+        if not counter_changed:
+            self.coords_last_block = None
+    
+    def update_dimensions(self, frame):
+        annotated = frame.copy()
+        self.height, self.width, _ = annotated.shape
+
+    def reset_states(self, frame_state_result):
+        if self.active_counting_state and self.crossed_back and frame_state_result == 'crossed':
+            self.active_counting_state = False
+
+        if frame_state_result == 'crossedBack':
+            self.crossed_back = True
+
+    def update_all(self, frame, frame_result, tracked: 'np.ndarray | None' = None):
+        self.update_dimensions(frame)
+        self.update_curr_blocks_in_target(tracked)
+        self.update_prev_blocks_in_target()
+        self.update_counter()
+        self.reset_states(frame_result)
 
 def make_tracker(name: str, track_buffer: int = 30):
     """Instantiate a boxmot motion-only tracker by name."""
@@ -44,7 +153,6 @@ HANDEDNESS_TEXT_COLOR = (88, 205, 54) # vibrant green
 TRACKER_COLOR = (255, 255, 0)  # cyan for tracker boxes
 COUNTER_COLOR = (138,43,226) # violet for counting boxes
 
-
 def cgrect_to_norm_xyxy(detection):
     """Convert a Vision cgRect dict to normalized [x1, y1, x2, y2] (top-left origin)."""
     rect = detection.get('cgRect')
@@ -63,19 +171,11 @@ FONT_SIZE = 1
 FONT_THICKNESS = 1
 HANDEDNESS_TEXT_COLOR = (88, 205, 54) # vibrant green
 
-# --- Counter state ---
-counter = 0
-active_counting_state = False
-
 # Delimiter line state: two (pixel) endpoints, and which x-side triggers a crossing.
 # target_zone_pts = (top_left, top_right) where each pt is (x, y) in pixel coords.
 # target_side = 'right' | 'left'  — the side a block must cross INTO to count.
 target_zone_pts = None 
 target_side = None 
-prev_detected_in_target = None
-crossed_back = False
-counted_ids = set()
-target_block_registry: dict[int, Block] = {}   # track_id -> Block
 
 # Mapping from Vision framework joint names to MediaPipe landmark indices
 VISION_TO_MEDIAPIPE = {
@@ -227,7 +327,6 @@ def tracker_block_in_target_zone(scaled_norm):
 
     return False
 
-
 def draw_landmarks_on_image(rgb_image, detection_result):
   """
   Draw hand landmarks on image using Vision framework detection results.
@@ -353,40 +452,6 @@ def draw_cgrect_bboxes(bgr_image, detection, color=(0, 0, 255), thickness=2):
 
     return annotated
 
-def has_movement(block: Block, threshold: float = 0.25) -> bool:
-    """Return True if the block's center has moved by at least `threshold` fraction
-    of the bbox dimensions across its last-5 history.
-
-    Movement is measured as the Chebyshev-style max displacement of the center
-    relative to the mean bbox size (width or height), so the threshold is
-    scale-invariant.
-
-    Args:
-        block:     Block instance with last5box entries [x1, y1, x2, y2] normalized.
-        threshold: Minimum fractional displacement to count as movement (default 0.25).
-
-    Returns:
-        bool
-    """
-    if len(block.last5box) < 2:
-        return False
-
-    centers = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in block.last5box]
-    sizes   = [(b[2] - b[0], b[3] - b[1]) for b in block.last5box]
-
-    mean_w = sum(s[0] for s in sizes) / len(sizes)
-    mean_h = sum(s[1] for s in sizes) / len(sizes)
-    ref    = max(mean_w, mean_h)  # single scale reference
-
-    if ref == 0:
-        return False
-
-    first_cx, first_cy = centers[0]
-    last_cx,  last_cy  = centers[-1]
-
-    displacement = ((last_cx - first_cx) ** 2 + (last_cy - first_cy) ** 2) ** 0.5
-    return 1 >= (displacement / ref) >= threshold
-
 def draw_target_zone_lines(bgr_image): 
     """Overlay the computed delimiter line segment on the frame."""
     global target_zone_pts
@@ -405,8 +470,7 @@ def draw_target_zone_lines(bgr_image):
     cv.line(annotated, bottom_left, bottom_right, (0, 255, 255), 2)  # yellow line
     return annotated
 
-
-def visualize_frame(frame, frameResult: pd.Series, tracked: 'np.ndarray | None' = None):
+def visualize_frame(frame, frameResult: pd.Series, tracked: 'np.ndarray | None' = None, counter = None):
     """Visualize all detections from a frame result on the input frame.
     
     Also updates the crossing counter based on blockDetections vs the delimiter line.
@@ -418,7 +482,7 @@ def visualize_frame(frame, frameResult: pd.Series, tracked: 'np.ndarray | None' 
     Returns:
         Annotated BGR image with all detections drawn
     """
-    global counter, prev_detected_in_target, target_block_registry, crossed_back, active_counting_state, target_zone_pts, target_side
+    global target_zone_pts, target_side
 
     annotated = frame.copy()
     height, width, _ = annotated.shape
@@ -430,6 +494,8 @@ def visualize_frame(frame, frameResult: pd.Series, tracked: 'np.ndarray | None' 
         if target_zone_pts is None:
             # Compute for the first time
             target_zone_pts = compute_target_zone_from_box(box, width, height)
+        
+        annotated = draw_target_zone_lines(annotated)
 
     # --- Draw hand landmarks ---
     if 'hands' in frameResult and isinstance(frameResult['hands'], list):
@@ -441,77 +507,53 @@ def visualize_frame(frame, frameResult: pd.Series, tracked: 'np.ndarray | None' 
             if 'boundingBox' in face and face['boundingBox']:
                 annotated = draw_cgrect_bboxes(annotated, face['boundingBox'])
 
-    # --- Draw block detections and update counter ---\
+    # --- Draw block detections ---
     cur_detected_in_target = 0
     if 'blockDetections' in frameResult and frameResult['blockDetections']:
         for blockDetection in frameResult['blockDetections']:
             annotated = draw_cgrect_bboxes(annotated, blockDetection['boundingBox'],
                                            color=(255, 0, 255), thickness=2)
-            rect = blockDetection['boundingBox'].get('cgRect')
-            if rect and block_in_target_zone(rect, width, height):
-                cur_detected_in_target += 1
 
-    # Draw tracker boxes in cyan: columns [x1,y1,x2,y2,track_id,...]
+    # --- Draw tracker block detections ---
+        # columns [x1,y1,x2,y2,track_id,...]
     if tracked is not None and len(tracked) > 0:
-        curr_target_tids = set()
         for row in tracked:
             x1, y1, x2, y2, tid = row[0], row[1], row[2], row[3], int(row[4])
             px1, py1 = int(x1 * width), int(y1 * height)
             px2, py2 = int(x2 * width), int(y2 * height)
-
-            if tracker_block_in_target_zone([px1, py1, px2, py2]):
-                curr_target_tids.add(tid)
-                if tid not in target_block_registry:
-                    target_block_registry[tid] = Block(id=tid)
-
-                target_block_registry[tid].update([x1, y1, x2, y2])
-                
             cv.rectangle(annotated, (px1, py1), (px2, py2), TRACKER_COLOR, 2)
             cv.putText(annotated, f"T{tid}", (px1, max(py1 - 6, 10)),
                        cv.FONT_HERSHEY_SIMPLEX, 0.6, TRACKER_COLOR, 2, cv.LINE_AA)
-        
-        for tid in target_block_registry:
-            if tid not in curr_target_tids:
-                target_block_registry[tid].update([0, 0, 0, 0])
 
-    # --- NEW Counter logic ---
-
-    for tid, blk in target_block_registry.items():
-        if active_counting_state:
-            continue
-        if not has_movement(blk):
-            continue
-        if tid in counted_ids:
-            continue
-        counter += 1
-        counted_ids.add(tid)
-        x1, y1, x2, y2 = blk.last5box[-1]
+    # --- Highlight possible new block added ---
+    if counter is not None and counter.coords_last_block is not None:
+        x1, y1, x2, y2 = counter.coords_last_block
         cv.rectangle(annotated, (int(x1 * width), int(y1 * height)), 
             (int(x2 * width), int(y2 * height)), COUNTER_COLOR, 2)
         cv.putText(annotated, f"T{tid}", (int(x1 * width), max(int(y1 * height) - 6, 10)),
             cv.FONT_HERSHEY_SIMPLEX, 0.6, COUNTER_COLOR, 2, cv.LINE_AA)
-        active_counting_state = True
-        crossed_back = False
-
-    # Reset active_counting_state when crossed_back and state is "crossed"
-    if active_counting_state and crossed_back and frameResult['state'] == 'crossed':
-        active_counting_state = False
-
-    if frameResult['state'] == 'crossedBack':
-        crossed_back = True
-
-    # --- Draw delimiter line ---
-    annotated = draw_target_zone_lines(annotated)
 
     return annotated
 
+def process_video(mode, cap):
+    # TO DO: refactor video processing from main, 
+    # add logic for writing results to file if in test mode
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('video_path', help='Path to the video file')
+    parser.add_argument('video_path', 
+                        help='Path to the video file')
     parser.add_argument('--tracker', choices=MOTION_TRACKERS, default='bytetrack',
                         help='Tracker to use (default: bytetrack)')
     parser.add_argument('--track_buffer', type=int, default=30,
                         help='Frames to keep a lost track alive (bytetrack only, default: 30)')
+    parser.add_argument('--mode', choices=MODES, default='manual', 
+                        help='Mode to enter (default: manual)')
+    
+    # add new CLI arg 
+        # changing threshold for movement
+        # automating process, writing out to data file
+
     args = parser.parse_args()
 
     video_path = args.video_path
@@ -539,14 +581,12 @@ def main():
     global target_side
     target_side = 'right'  # default: hand moving left→right
 
-    global prev_detected_in_target
-    prev_detected_in_target = 0
-
     print(f"Pre-computing tracks with {args.tracker}...")
 
     tracker = make_tracker(args.tracker, args.track_buffer)
     block_tracked = {}  # df row index -> np.ndarray (n, 8) or None
     dummy_frame = np.zeros((1, 1, 3), dtype=np.uint8)
+    counter = Counter()
 
     for idx, row in df.iterrows():
         block_dets = row.get('blockDetections') or []
@@ -563,6 +603,8 @@ def main():
         else:
             block_tracked[idx] = tracker.update(np.empty((0, 6), dtype=np.float32), dummy_frame)
 
+
+    mode = args.mode
     print("Controls: A/D (±1 frame), W/S (±10 frames), Q (quit)")
 
     while True:
@@ -582,11 +624,12 @@ def main():
             print("Data frame indices: ", match_idx)
             frameResult = df.iloc[match_idx[0]]
             tracked = block_tracked.get(match_idx[0])
-            frame = visualize_frame(frame, frameResult, tracked=tracked)
+            counter.update_all(frame, frameResult['state'], tracked=tracked)
+            frame = visualize_frame(frame, frameResult, tracked=tracked, counter=counter)
             state_text = f"State: {frameResult['state']}"
 
         # --- All HUD text drawn here, same position as original Time/Frame line ---
-        cv.putText(frame, f"Time: {time_ms:.6f}ms | Frame: {current_frame} | Counter = {counter}",
+        cv.putText(frame, f"Time: {time_ms:.6f}ms | Frame: {current_frame} | Counter = {counter.counter}",
                    (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         if state_text:
             cv.putText(frame, state_text,
