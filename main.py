@@ -23,7 +23,7 @@ class Block:
             self.last5box.pop(0)
 
 MOTION_TRACKERS = ['bytetrack', 'ocsort', 'sfsort', 'boosttrack']
-MODES = ['manual', 'automatic', 'test']
+MODES = ['manual', 'test']
 
 class Counter:
     counter = 0
@@ -35,9 +35,10 @@ class Counter:
     curr_target_tids = set()
     coords_last_block = []
     target_block_registry: dict[int, Block] = {}   # track_id -> Block
+    target_zone = None
 
-    def __init__(self): 
-        pass
+    def __init__(self, target_zone): 
+        self.target_zone = target_zone
 
     def has_movement(self, block: Block, threshold: float = 0.25) -> bool:
         """Return True if the block's center has moved by at least `threshold` fraction
@@ -80,7 +81,7 @@ class Counter:
                 px1, py1 = int(x1 * self.width), int(y1 * self.height)
                 px2, py2 = int(x2 * self.width), int(y2 * self.height)
 
-                if tracker_block_in_target_zone([px1, py1, px2, py2]):
+                if self.tracker_block_in_target_zone([px1, py1, px2, py2]):
                     self.curr_target_tids.add(tid)
 
                     if tid not in self.target_block_registry:
@@ -133,6 +134,44 @@ class Counter:
         self.update_counter()
         self.reset_states(frame_result)
 
+    def tracker_block_in_target_zone(self, scaled_norm):
+        """Return True if a cgRect bounding box overlaps the x and y-range of the delimiter line.
+
+        Args:
+            scaled_norm: [px1, py1, px2, py2] — normalized and scaled Vision coord.
+
+        Returns:
+            bool
+        """
+        block_x1, block_y1, block_x2, block_y2 = scaled_norm
+
+        poly = self.trapezoid_polygon()
+
+        # Check all four corners of the block bbox
+        corners = [
+            (block_x1, block_y1),  # top-left
+            (block_x2, block_y1),  # top-right
+            (block_x1, block_y2),  # bottom-left
+            (block_x2, block_y2),  # bottom-right
+        ]
+        for pt in corners:
+            # >= 0 means inside or on the edge
+            if cv.pointPolygonTest(poly, pt, measureDist=False) >= 0:
+                return True
+
+        return False
+    
+    def trapezoid_polygon(self):
+        """Return the trapezoid as an ordered numpy contour for cv.pointPolygonTest.
+        Order: top-left → top-right → bottom-right → bottom-left (clockwise).
+        """
+        return np.array([
+            self.target_zone["top_left"],
+            self.target_zone["top_right"],
+            self.target_zone["bottom_right"],
+            self.target_zone["bottom_left"],
+        ], dtype=np.float32)
+
 def make_tracker(name: str, track_buffer: int = 30):
     """Instantiate a boxmot motion-only tracker by name."""
     if name == 'bytetrack':
@@ -171,12 +210,6 @@ FONT_SIZE = 1
 FONT_THICKNESS = 1
 HANDEDNESS_TEXT_COLOR = (88, 205, 54) # vibrant green
 
-# Delimiter line state: two (pixel) endpoints, and which x-side triggers a crossing.
-# target_zone_pts = (top_left, top_right) where each pt is (x, y) in pixel coords.
-# target_side = 'right' | 'left'  — the side a block must cross INTO to count.
-target_zone_pts = None 
-target_side = None 
-
 # Mapping from Vision framework joint names to MediaPipe landmark indices
 VISION_TO_MEDIAPIPE = {
     'wrist': 0,
@@ -189,7 +222,7 @@ VISION_TO_MEDIAPIPE = {
     'thumbMP': 2
 }
 
-def compute_target_zone_from_box(box_detection, img_width, img_height):
+def compute_target_zone(df, img_height, target_side):
     """Computes the target zone, a trapezoidal shape, from keypoints. 
 
     The returned lines are always stored globally; call this once when the box is
@@ -199,12 +232,25 @@ def compute_target_zone_from_box(box_detection, img_width, img_height):
         box_detection: dict with 'keypoints' list; each keypoint has
                        'position' [x, y] in pixels (Vision y-axis, not flipped yet)
                        and optional 'confidence'.
-        img_width, img_height: frame dimensions in pixels.
+        img_height: frame dimensions in pixels.
 
     Returns:
         (top_left, top_right): two (x, y) pixel tuples representing the delimiter
                              segment, or None if fewer than 3 keypoints exist.
     """
+    box_detection = None
+
+    # find first valid box detection
+    for idx in range(0, len(df)):
+        row = df.iloc[idx]
+        box_detection = row.get('boxDetection')  # or row['boxDetection'] if you're sure it exists
+
+        # Adjust validity check to match your data type:
+        if box_detection is None or (hasattr(box_detection, '__len__') and len(box_detection) == 0):
+            continue  # skip empty/null detections
+
+        break
+
     keypoints = box_detection.get('keypoints', [])
     if len(keypoints) < 3:
         return None
@@ -231,7 +277,6 @@ def compute_target_zone_from_box(box_detection, img_width, img_height):
     split_pt = (split_x, split_y)
 
     # Choose the half according to target_side
-    global target_side
     if target_side == 'right':
         top_left = split_pt
         bottom_left = pts[2]
@@ -245,87 +290,6 @@ def compute_target_zone_from_box(box_detection, img_width, img_height):
         "top_right" : top_right,
         "bottom_right" : bottom_right
     }
-
-def trapezoid_polygon():
-    """Return the trapezoid as an ordered numpy contour for cv.pointPolygonTest.
-    Order: top-left → top-right → bottom-right → bottom-left (clockwise).
-    """
-    global target_zone_pts
-
-    return np.array([
-        target_zone_pts["top_left"],
-        target_zone_pts["top_right"],
-        target_zone_pts["bottom_right"],
-        target_zone_pts["bottom_left"],
-    ], dtype=np.float32)
-
-def block_in_target_zone(cgRect, img_width, img_height):
-    """Return True if a cgRect bounding box overlaps the x and y-range of the delimiter line.
-
-    Args:
-        cgRect: [[x_norm, y_norm], [w_norm, h_norm]] — normalized Vision coords.
-        img_width, img_height: frame dimensions.
-
-    Returns:
-        bool
-    """
-    global target_zone_pts
-    if target_zone_pts is None:
-        return False
-
-    (x_norm, y_norm), (w_norm, h_norm) = cgRect
-    block_x1 = x_norm * img_width
-    block_x2 = (x_norm + w_norm) * img_width
-    block_y_top_norm = y_norm + h_norm
-    block_y1 = int((1 - block_y_top_norm) * img_height)
-    block_y2 = int((1 - y_norm) * img_height)
-
-    poly = trapezoid_polygon()
-
-    # Check all four corners of the block bbox
-    corners = [
-        (block_x1, block_y1),  # top-left
-        (block_x2, block_y1),  # top-right
-        (block_x1, block_y2),  # bottom-left
-        (block_x2, block_y2),  # bottom-right
-    ]
-    for pt in corners:
-        # >= 0 means inside or on the edge
-        if cv.pointPolygonTest(poly, pt, measureDist=False) >= 0:
-            return True
-
-    return False
-
-def tracker_block_in_target_zone(scaled_norm):
-    """Return True if a cgRect bounding box overlaps the x and y-range of the delimiter line.
-
-    Args:
-        scaled_norm: [px1, py1, px2, py2] — normalized and scaled Vision coord.
-
-    Returns:
-        bool
-    """
-    global target_zone_pts
-    if target_zone_pts is None:
-        return False
-
-    block_x1, block_y1, block_x2, block_y2 = scaled_norm
-
-    poly = trapezoid_polygon()
-
-    # Check all four corners of the block bbox
-    corners = [
-        (block_x1, block_y1),  # top-left
-        (block_x2, block_y1),  # top-right
-        (block_x1, block_y2),  # bottom-left
-        (block_x2, block_y2),  # bottom-right
-    ]
-    for pt in corners:
-        # >= 0 means inside or on the edge
-        if cv.pointPolygonTest(poly, pt, measureDist=False) >= 0:
-            return True
-
-    return False
 
 def draw_landmarks_on_image(rgb_image, detection_result):
   """
@@ -452,17 +416,14 @@ def draw_cgrect_bboxes(bgr_image, detection, color=(0, 0, 255), thickness=2):
 
     return annotated
 
-def draw_target_zone_lines(bgr_image): 
+def draw_target_zone_lines(bgr_image, target_zone): 
     """Overlay the computed delimiter line segment on the frame."""
-    global target_zone_pts
-    if target_zone_pts is None:
-        return bgr_image
     annotated = bgr_image.copy()
-
-    top_left = (int(target_zone_pts["top_left"][0]), int(target_zone_pts["top_left"][1]))
-    bottom_left = (int(target_zone_pts["bottom_left"][0]), int(target_zone_pts["bottom_left"][1]))
-    top_right = (int(target_zone_pts["top_right"][0]), int(target_zone_pts["top_right"][1]))
-    bottom_right = (int(target_zone_pts["bottom_right"][0]), int(target_zone_pts["bottom_right"][1]))
+    
+    top_left = (int(target_zone["top_left"][0]), int(target_zone["top_left"][1]))
+    bottom_left = (int(target_zone["bottom_left"][0]), int(target_zone["bottom_left"][1]))
+    top_right = (int(target_zone["top_right"][0]), int(target_zone["top_right"][1]))
+    bottom_right = (int(target_zone["bottom_right"][0]), int(target_zone["bottom_right"][1]))
 
     cv.line(annotated, top_left, top_right, (0, 255, 255), 2)  # yellow line
     cv.line(annotated, top_left, bottom_left, (0, 255, 255), 2)  # yellow line
@@ -470,7 +431,7 @@ def draw_target_zone_lines(bgr_image):
     cv.line(annotated, bottom_left, bottom_right, (0, 255, 255), 2)  # yellow line
     return annotated
 
-def visualize_frame(frame, frameResult: pd.Series, tracked: 'np.ndarray | None' = None, counter = None):
+def visualize_frame(frame, frameResult: pd.Series, tracked: 'np.ndarray | None' = None, counter = None, target_zone = None):
     """Visualize all detections from a frame result on the input frame.
     
     Also updates the crossing counter based on blockDetections vs the delimiter line.
@@ -482,7 +443,6 @@ def visualize_frame(frame, frameResult: pd.Series, tracked: 'np.ndarray | None' 
     Returns:
         Annotated BGR image with all detections drawn
     """
-    global target_zone_pts, target_side
 
     annotated = frame.copy()
     height, width, _ = annotated.shape
@@ -491,11 +451,7 @@ def visualize_frame(frame, frameResult: pd.Series, tracked: 'np.ndarray | None' 
     if 'boxDetection' in frameResult and frameResult['boxDetection']:
         box = frameResult['boxDetection']
         annotated = draw_keypoints_on_image(annotated, box)
-        if target_zone_pts is None:
-            # Compute for the first time
-            target_zone_pts = compute_target_zone_from_box(box, width, height)
-        
-        annotated = draw_target_zone_lines(annotated)
+        annotated = draw_target_zone_lines(annotated, target_zone)
 
     # --- Draw hand landmarks ---
     if 'hands' in frameResult and isinstance(frameResult['hands'], list):
@@ -535,10 +491,6 @@ def visualize_frame(frame, frameResult: pd.Series, tracked: 'np.ndarray | None' 
 
     return annotated
 
-def process_video(mode, cap):
-    # TO DO: refactor video processing from main, 
-    # add logic for writing results to file if in test mode
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('video_path', 
@@ -547,8 +499,8 @@ def main():
                         help='Tracker to use (default: bytetrack)')
     parser.add_argument('--track_buffer', type=int, default=30,
                         help='Frames to keep a lost track alive (bytetrack only, default: 30)')
-    parser.add_argument('--mode', choices=MODES, default='manual', 
-                        help='Mode to enter (default: manual)')
+    # parser.add_argument('--mode', choices=MODES, default='manual', 
+    #                     help='Mode to enter (default: manual)')
     
     # add new CLI arg 
         # changing threshold for movement
@@ -578,15 +530,16 @@ def main():
 
     print(f"Video loaded. FPS: {fps}, Total frames: {frame_count}")
 
-    global target_side
-    target_side = 'right'  # default: hand moving left→right
+    target_side = 'right'  # default: hand moving left→right; TO DO: is there data in the df that tells us side?
+    img_height = int(cap.get(cv.CAP_PROP_FRAME_HEIGHT))
+    target_zone = compute_target_zone(df, img_height, target_side)
 
     print(f"Pre-computing tracks with {args.tracker}...")
 
     tracker = make_tracker(args.tracker, args.track_buffer)
     block_tracked = {}  # df row index -> np.ndarray (n, 8) or None
     dummy_frame = np.zeros((1, 1, 3), dtype=np.uint8)
-    counter = Counter()
+    counter = Counter(target_zone)
 
     for idx, row in df.iterrows():
         block_dets = row.get('blockDetections') or []
@@ -604,7 +557,7 @@ def main():
             block_tracked[idx] = tracker.update(np.empty((0, 6), dtype=np.float32), dummy_frame)
 
 
-    mode = args.mode
+    # mode = args.mode
     print("Controls: A/D (±1 frame), W/S (±10 frames), Q (quit)")
 
     while True:
@@ -625,7 +578,7 @@ def main():
             frameResult = df.iloc[match_idx[0]]
             tracked = block_tracked.get(match_idx[0])
             counter.update_all(frame, frameResult['state'], tracked=tracked)
-            frame = visualize_frame(frame, frameResult, tracked=tracked, counter=counter)
+            frame = visualize_frame(frame, frameResult, tracked=tracked, counter=counter, target_zone=target_zone)
             state_text = f"State: {frameResult['state']}"
 
         # --- All HUD text drawn here, same position as original Time/Frame line ---
