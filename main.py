@@ -5,25 +5,10 @@ from mediapipe.framework.formats import landmark_pb2
 import numpy as np
 import cv2 as cv
 import pandas as pd
-import os
 from pathlib import Path
 import boxmot
-from dataclasses import dataclass, field
-
-# --- Block tracking struct ---
-@dataclass
-class Block:
-    id: int
-    last5box: list = field(default_factory=list)  # up to 5 [x1,y1,x2,y2] normalized bboxes
-
-    def update(self, bbox_norm):
-        """Append a new normalized [x1,y1,x2,y2] bbox, keeping only the last 5."""
-        self.last5box.append(bbox_norm)
-        if len(self.last5box) > 5:
-            self.last5box.pop(0)
-
-MOTION_TRACKERS = ['bytetrack', 'ocsort', 'sfsort', 'boosttrack']
-MODES = ['manual', 'test']
+from Block import Block
+from config import *
 
 class Counter:
     counter = 0
@@ -499,8 +484,8 @@ def main():
                         help='Tracker to use (default: bytetrack)')
     parser.add_argument('--track_buffer', type=int, default=30,
                         help='Frames to keep a lost track alive (bytetrack only, default: 30)')
-    # parser.add_argument('--mode', choices=MODES, default='manual', 
-    #                     help='Mode to enter (default: manual)')
+    parser.add_argument('--mode', choices=MODES, default='manual', 
+                        help='Mode to enter (default: manual)')
     
     # add new CLI arg 
         # changing threshold for movement
