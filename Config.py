@@ -1,5 +1,6 @@
 MOTION_TRACKERS = ['bytetrack', 'ocsort', 'sfsort', 'boosttrack']
-MODES = ['manual', 'test']
+MODES = ['manual', 'auto']
+MVMT_THRESHOLD = ['0.15', '0.20', '0.25']
 
 MARGIN = 10  # pixels
 FONT_SIZE = 1

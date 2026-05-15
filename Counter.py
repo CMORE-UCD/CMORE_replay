@@ -1,5 +1,6 @@
 from Block import Block
 import numpy as np
+import cv2 as cv
 
 class Counter:
     counter = 0

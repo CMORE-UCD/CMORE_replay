@@ -1,245 +1,9 @@
-import sys
 import argparse
 import numpy as np
-import cv2 as cv
-import pandas as pd
-from pathlib import Path
-import boxmot
 
-from Block import Block
+from TemporaryManual import TemporaryManual
+from TemporaryAuto import TemporaryAuto
 from Config import *
-from Counter import Counter
-from VisUtils import draw_landmarks_on_image
-
-def make_tracker(name: str, track_buffer: int = 30):
-    """Instantiate a boxmot motion-only tracker by name."""
-    if name == 'bytetrack':
-        return boxmot.ByteTrack(track_buffer=track_buffer)
-    elif name == 'ocsort':
-        return boxmot.OcSort()
-    elif name == 'sfsort':
-        return boxmot.SFSORT()
-    elif name == 'boosttrack':
-        return boxmot.BoostTrack()
-    else:
-        raise ValueError(f"Unknown tracker '{name}'. Choose from: {MOTION_TRACKERS}")
-
-def cgrect_to_norm_xyxy(detection):
-    """Convert a Vision cgRect dict to normalized [x1, y1, x2, y2] (top-left origin)."""
-    rect = detection.get('cgRect')
-    if rect and len(rect) == 2:
-        (x_norm, y_norm), (w_norm, h_norm) = rect
-        x1 = x_norm
-        x2 = x_norm + w_norm
-        y1 = 1.0 - (y_norm + h_norm)  # flip y: Vision bottom-left → top-left
-        y2 = 1.0 - y_norm
-        if w_norm > 0 and h_norm > 0:
-            return [x1, y1, x2, y2]
-    return None
-
-
-
-def compute_target_zone(df, img_height, target_side):
-    """Computes the target zone, a trapezoidal shape, from keypoints. 
-
-    The returned lines are always stored globally; call this once when the box is
-    first detected.
-
-    Args:
-        box_detection: dict with 'keypoints' list; each keypoint has
-                       'position' [x, y] in pixels (Vision y-axis, not flipped yet)
-                       and optional 'confidence'.
-        img_height: frame dimensions in pixels.
-
-    Returns:
-        (top_left, top_right): two (x, y) pixel tuples representing the delimiter
-                             segment, or None if fewer than 3 keypoints exist.
-    """
-    box_detection = None
-
-    # find first valid box detection
-    for idx in range(0, len(df)):
-        row = df.iloc[idx]
-        box_detection = row.get('boxDetection')  # or row['boxDetection'] if you're sure it exists
-
-        # Adjust validity check to match your data type:
-        if box_detection is None or (hasattr(box_detection, '__len__') and len(box_detection) == 0):
-            continue  # skip empty/null detections
-
-        break
-
-    keypoints = box_detection.get('keypoints', [])
-    if len(keypoints) < 3:
-        return None
-
-    # Flip y to screen coordinates (same transform used during drawing)
-    pts = []
-    for kp in keypoints:
-        x, y = kp.get('position', [0, 0])
-        y_screen = img_height - y
-        pts.append((x, y_screen))
-
-    
-    top_middle, top_left, top_right = pts[6], pts[8], pts[9]
-    bottom_left, bottom_right = pts[0], pts[4]
-
-    # Split the bottom segment at the x-coordinate of the top point
-    split_x = top_middle[0]
-    # Linearly interpolate y on the segment top_left→top_right at x=split_x
-    if top_right[0] != top_left[0]:
-        t = (split_x - top_left[0]) / (top_right[0] - top_left[0])
-        split_y = top_left[1] + t * (top_right[1] - top_left[1])
-    else:
-        split_y = (top_left[1] + top_right[1]) / 2.0
-    split_pt = (split_x, split_y)
-
-    # Choose the half according to target_side
-    if target_side == 'right':
-        top_left = split_pt
-        bottom_left = pts[2]
-    else:
-        top_right = split_pt
-        bottom_right = pts[2]
-
-    return {
-        "top_left" : top_left,
-        "bottom_left" : bottom_left,
-        "top_right" : top_right,
-        "bottom_right" : bottom_right
-    }
-
-
-def draw_keypoints_on_image(bgr_image, detection, point_color=(0, 255, 0), box_color=(255, 0, 0), radius=4):
-    """Draw keypoints and bounding box for a Vision detection.
-
-    Args:
-        bgr_image: OpenCV BGR image.
-        detection: Dict with 'keypoints' (list of dicts with 'position' [x, y] in pixels
-                   and optional 'confidence'), plus centerX/centerY/width/height/objectConf.
-        point_color: BGR tuple for keypoint circles.
-        box_color: BGR tuple for bounding box rectangle.
-        radius: Circle radius in pixels.
-
-    Returns:
-        Annotated copy of the image.
-    """
-    annotated = bgr_image.copy()
-    height, width, _ = annotated.shape
-
-    keypoints = detection.get('keypoints', [])
-    for kp in keypoints:
-        conf = kp.get('confidence', 0)
-        x, y = kp.get('position', [0, 0])
-        y = height - y  # Flip y-coordinate
-        cv.circle(annotated, (int(x), int(y)), radius, point_color, thickness=-1)
-        cv.putText(annotated, f"{conf:.3f}", (int(x) + 5, int(y) - 5),
-                   cv.FONT_HERSHEY_SIMPLEX, 0.4, point_color, 1, cv.LINE_AA)
-
-    return annotated
-
-def draw_cgrect_bboxes(bgr_image, detection, color=(0, 0, 255), thickness=2):
-    """Draw bounding boxes described by Vision-style cgRect on a BGR image.
-
-    Args:
-        bgr_image: OpenCV BGR image.
-        detection: Dict containing 'cgRect': [[x, y], [w, h]] with normalized values (0-1).
-                   Vision uses origin at bottom-left, so we flip y accordingly.
-        color: BGR color for rectangle.
-        thickness: Line thickness for rectangle.
-
-    Returns:
-        Annotated copy of the image.
-    """
-    annotated = bgr_image.copy()
-    h_img, w_img, _ = annotated.shape
-
-    rect = detection.get('cgRect')
-    if rect and len(rect) == 2:
-        (x_norm, y_norm), (w_norm, h_norm) = rect
-        # Convert normalized rect (origin bottom-left) to pixel box (origin top-left)
-        x1 = int(x_norm * w_img)
-        x2 = int((x_norm + w_norm) * w_img)
-        y_top_norm = y_norm + h_norm
-        y1 = int((1 - y_top_norm) * h_img)
-        y2 = int((1 - y_norm) * h_img)
-        cv.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
-
-    return annotated
-
-def draw_target_zone_lines(bgr_image, target_zone): 
-    """Overlay the computed delimiter line segment on the frame."""
-    annotated = bgr_image.copy()
-    
-    top_left = (int(target_zone["top_left"][0]), int(target_zone["top_left"][1]))
-    bottom_left = (int(target_zone["bottom_left"][0]), int(target_zone["bottom_left"][1]))
-    top_right = (int(target_zone["top_right"][0]), int(target_zone["top_right"][1]))
-    bottom_right = (int(target_zone["bottom_right"][0]), int(target_zone["bottom_right"][1]))
-
-    cv.line(annotated, top_left, top_right, (0, 255, 255), 2)  # yellow line
-    cv.line(annotated, top_left, bottom_left, (0, 255, 255), 2)  # yellow line
-    cv.line(annotated, top_right, bottom_right, (0, 255, 255), 2)  # yellow line
-    cv.line(annotated, bottom_left, bottom_right, (0, 255, 255), 2)  # yellow line
-    return annotated
-
-def visualize_frame(frame, frameResult: pd.Series, tracked: 'np.ndarray | None' = None, counter = None, target_zone = None):
-    """Visualize all detections from a frame result on the input frame.
-    
-    Also updates the crossing counter based on blockDetections vs the delimiter line.
-    
-    Args:
-        frame: BGR image from OpenCV
-        frameResult: Detection result dictionary containing hands, faces, boxDetection, blockDetections
-        
-    Returns:
-        Annotated BGR image with all detections drawn
-    """
-
-    annotated = frame.copy()
-    height, width, _ = annotated.shape
-
-    # --- Build / refresh the delimiter line from boxDetection keypoints ---
-    if 'boxDetection' in frameResult and frameResult['boxDetection']:
-        box = frameResult['boxDetection']
-        annotated = draw_keypoints_on_image(annotated, box)
-        annotated = draw_target_zone_lines(annotated, target_zone)
-
-    # --- Draw hand landmarks ---
-    if 'hands' in frameResult and isinstance(frameResult['hands'], list):
-        annotated = draw_landmarks_on_image(annotated, frameResult['hands'])
-
-    # --- Draw face bounding boxes ---
-    if 'faces' in frameResult and frameResult['faces']:
-        for face in frameResult['faces']:
-            if 'boundingBox' in face and face['boundingBox']:
-                annotated = draw_cgrect_bboxes(annotated, face['boundingBox'])
-
-    # --- Draw block detections ---
-    cur_detected_in_target = 0
-    if 'blockDetections' in frameResult and frameResult['blockDetections']:
-        for blockDetection in frameResult['blockDetections']:
-            annotated = draw_cgrect_bboxes(annotated, blockDetection['boundingBox'],
-                                           color=(255, 0, 255), thickness=2)
-
-    # --- Draw tracker block detections ---
-        # columns [x1,y1,x2,y2,track_id,...]
-    if tracked is not None and len(tracked) > 0:
-        for row in tracked:
-            x1, y1, x2, y2, tid = row[0], row[1], row[2], row[3], int(row[4])
-            px1, py1 = int(x1 * width), int(y1 * height)
-            px2, py2 = int(x2 * width), int(y2 * height)
-            cv.rectangle(annotated, (px1, py1), (px2, py2), TRACKER_COLOR, 2)
-            cv.putText(annotated, f"T{tid}", (px1, max(py1 - 6, 10)),
-                       cv.FONT_HERSHEY_SIMPLEX, 0.6, TRACKER_COLOR, 2, cv.LINE_AA)
-
-    # --- Highlight possible new block added ---
-    if counter is not None and counter.coords_last_block is not None:
-        x1, y1, x2, y2 = counter.coords_last_block
-        cv.rectangle(annotated, (int(x1 * width), int(y1 * height)), 
-            (int(x2 * width), int(y2 * height)), COUNTER_COLOR, 2)
-        cv.putText(annotated, f"T{tid}", (int(x1 * width), max(int(y1 * height) - 6, 10)),
-            cv.FONT_HERSHEY_SIMPLEX, 0.6, COUNTER_COLOR, 2, cv.LINE_AA)
-
-    return annotated
 
 def main():
     parser = argparse.ArgumentParser()
@@ -251,108 +15,26 @@ def main():
                         help='Frames to keep a lost track alive (bytetrack only, default: 30)')
     parser.add_argument('--mode', choices=MODES, default='manual', 
                         help='Mode to enter (default: manual)')
+    parser.add_argument('--mvmt_threshold', choices=MVMT_THRESHOLD, default='0.25', 
+                        help='Movement threshold to enter (default: 0.25)')
     
     # add new CLI arg 
         # changing threshold for movement
         # automating process, writing out to data file
 
     args = parser.parse_args()
+    processor = None
 
-    video_path = args.video_path
+    
 
-    timeTag = Path(video_path).stem.split('_')[2]
+    match args.mode:
+        case 'auto':
+            processor = TemporaryAuto(args)
+        case _:
+            processor = TemporaryManual(args)
 
-    # Open up the results
-    df = pd.read_json(f"CMORE_Results_{timeTag}.json")
-    timestamps = df['presentationTime'].to_numpy() * 1000.0
-
-    cap = cv.VideoCapture(video_path)
-
-    if not cap.isOpened():
-        print("Error: Could not open video file")
-        sys.exit(1)
-
-    fps = cap.get(cv.CAP_PROP_FPS)
-    tolerance = 10 # 1000 / fps
-    print(f"Using time tolerance of {tolerance:.3f}ms")
-    frame_count = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
-    current_frame = 0
-
-    print(f"Video loaded. FPS: {fps}, Total frames: {frame_count}")
-
-    target_side = 'right'  # default: hand moving left→right; TO DO: is there data in the df that tells us side?
-    img_height = int(cap.get(cv.CAP_PROP_FRAME_HEIGHT))
-    target_zone = compute_target_zone(df, img_height, target_side)
-
-    print(f"Pre-computing tracks with {args.tracker}...")
-
-    tracker = make_tracker(args.tracker, args.track_buffer)
-    block_tracked = {}  # df row index -> np.ndarray (n, 8) or None
-    dummy_frame = np.zeros((1, 1, 3), dtype=np.uint8)
-    counter = Counter(target_zone)
-
-    for idx, row in df.iterrows():
-        block_dets = row.get('blockDetections') or []
-        if not isinstance(block_dets, list):
-            block_dets = []
-        boxes = [cgrect_to_norm_xyxy(bd['boundingBox']) for bd in block_dets]
-        valid = [(b, bd) for b, bd in zip(boxes, block_dets) if b is not None]
-        if valid:
-            xyxy = np.array([b for b, _ in valid], dtype=np.float32)
-            conf = np.array([float(bd.get('confidence', 1.0)) for _, bd in valid], dtype=np.float32)
-            cls = np.zeros(len(valid), dtype=np.float32)
-            dets = np.column_stack([xyxy, conf, cls])
-            block_tracked[idx] = tracker.update(dets, dummy_frame)
-        else:
-            block_tracked[idx] = tracker.update(np.empty((0, 6), dtype=np.float32), dummy_frame)
-
-
-    # mode = args.mode
-    print("Controls: A/D (±1 frame), W/S (±10 frames), Q (quit)")
-
-    while True:
-        cap.set(cv.CAP_PROP_POS_FRAMES, current_frame)
-        ret, frame = cap.read()
-
-        if not ret:
-            break
-
-        time_ms = cap.get(cv.CAP_PROP_POS_MSEC)
-        print(f"Frame: {current_frame}, Time: {time_ms:.6f}ms")
-
-        # Apply detections / update counter
-        state_text = ""
-        match_idx = np.where(np.abs(timestamps - time_ms) < tolerance)[0]
-        if len(match_idx) > 0:
-            print("Data frame indices: ", match_idx)
-            frameResult = df.iloc[match_idx[0]]
-            tracked = block_tracked.get(match_idx[0])
-            counter.update_all(frame, frameResult['state'], tracked=tracked)
-            frame = visualize_frame(frame, frameResult, tracked=tracked, counter=counter, target_zone=target_zone)
-            state_text = f"State: {frameResult['state']}"
-
-        # --- All HUD text drawn here, same position as original Time/Frame line ---
-        cv.putText(frame, f"Time: {time_ms:.6f}ms | Frame: {current_frame} | Counter = {counter.counter}",
-                   (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        if state_text:
-            cv.putText(frame, state_text,
-                       (10, 60), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv.imshow("Video Player", frame)
-
-        key = cv.waitKey(0) & 0xFF
-        if key == ord('q'):
-            break
-        elif key == ord('a'):
-            current_frame = max(0, current_frame - 1)
-        elif key == ord('d'):
-            current_frame = min(frame_count - 1, current_frame + 1)
-        elif key == ord('w'):
-            current_frame = max(0, current_frame - 10)
-        elif key == ord('s'):
-            current_frame = min(frame_count - 1, current_frame + 10)
-
-    cap.release()
-    cv.destroyAllWindows()
+    if processor is not None:
+        processor.process_video()
 
 
 if __name__ == "__main__":
