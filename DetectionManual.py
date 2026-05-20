@@ -1,4 +1,4 @@
-from Temporary import Temporary
+from Detection import Detection
 from VisUtils import draw_landmarks_on_image
 
 import cv2 as cv
@@ -10,7 +10,7 @@ from Counter import Counter
 from Config import *
 
 
-class TemporaryManual(Temporary):
+class DetectionManual(Detection):
 
     def __init__(self, args):
         super().__init__(args)

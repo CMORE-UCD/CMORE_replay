@@ -1,8 +1,8 @@
 import argparse
 import numpy as np
 
-from TemporaryManual import TemporaryManual
-from TemporaryAuto import TemporaryAuto
+from DetectionManual import DetectionManual
+from DetectionAuto import DetectionAuto
 from Config import *
 
 def main():
@@ -29,9 +29,9 @@ def main():
 
     match args.mode:
         case 'auto':
-            processor = TemporaryAuto(args)
+            processor = DetectionAuto(args)
         case _:
-            processor = TemporaryManual(args)
+            processor = DetectionManual(args)
 
     if processor is not None:
         processor.process_video()

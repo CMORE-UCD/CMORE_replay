@@ -10,7 +10,7 @@ from Block import Block
 from Config import *
 from Counter import Counter
 
-class Temporary:
+class Detection:
     args = None
     video_path = None
     df = None

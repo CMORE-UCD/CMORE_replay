@@ -1,4 +1,4 @@
-from Temporary import Temporary
+from Detection import Detection
 import cv2 as cv
 import csv
 import pandas as pd
@@ -12,7 +12,7 @@ import progressbar
 import time
 
 
-class TemporaryAuto(Temporary):
+class DetectionAuto(Detection):
 
     def __init__(self, args):
         super().__init__(args)
@@ -23,7 +23,7 @@ class TemporaryAuto(Temporary):
     
         prev_count = 0
         # b = progressbar.ProgressBar(maxval=self.frame_count)
-        b = progressbar.ProgressBar(maxval=500)
+        b = progressbar.ProgressBar(maxval=500) #max_val should be frame_count, just using 500 for developing
         b.start()
      
         # while self.current_frame <= self.frame_count:
