@@ -40,7 +40,7 @@ class DetectionAuto(Detection):
             b.update(self.current_frame) 
 
         timeTag = Path(self.video_path).stem.split('_')[2]
-        with open(f'CMORE_Test_Results_{timeTag}.csv', 'w', newline='') as csvfile:
+        with open(f'CMORE_Test_Results_{timeTag}_{self.args.mvmt_threshold}.csv', 'w', newline='') as csvfile:
             fieldnames = self.record.keys
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()

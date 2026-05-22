@@ -35,7 +35,7 @@ class Detection:
         ret, frame = self.cap.read()
 
         self.setup_target_zone()
-        self.counter = Counter(self.target_zone, frame)
+        self.counter = Counter(self.target_zone, frame, args.mvmt_threshold)
         self.setup_tracker()
     
     def setup_cap(self):
@@ -52,9 +52,9 @@ class Detection:
         print(f"Video loaded. FPS: {fps}, Total frames: {self.frame_count}")
 
     def setup_target_zone(self):
-        target_side = 'right'  # default: hand moving left→right; TO DO: is there data in the df that tells us side?
         img_height = int(self.cap.get(cv.CAP_PROP_FRAME_HEIGHT))
-        self.target_zone = self.compute_target_zone(self.df, img_height, target_side)
+        img_width = int(self.cap.get(cv.CAP_PROP_FRAME_WIDTH))
+        self.target_zone = self.compute_target_zone(self.df, img_height, img_width)
 
     def setup_tracker(self):
         self.tracker = self.make_tracker(self.args.tracker, self.args.track_buffer)
@@ -101,7 +101,7 @@ class Detection:
                 return [x1, y1, x2, y2]
         return None
 
-    def compute_target_zone(self, df, img_height, target_side):
+    def compute_target_zone(self, df, img_height, img_width):
         """Computes the target zone, a trapezoidal shape, from keypoints. 
 
         The returned lines are always stored globally; call this once when the box is
@@ -156,7 +156,8 @@ class Detection:
         split_pt = (split_x, split_y)
 
         # Choose the half according to target_side
-        if target_side == 'right':
+        # choose side
+        if self.target_side(split_x, df, img_width) == 'right':
             top_left = split_pt
             bottom_left = pts[2]
         else:
@@ -169,6 +170,33 @@ class Detection:
             "top_right" : top_right,
             "bottom_right" : bottom_right
         }
+
+    def target_side(self, middle_x, df, img_width):
+        left_count = 0
+        right_count = 0
+
+        # up till first valid block detections
+
+        for idx, row in self.df.iterrows():
+            block_dets = row.get('blockDetections') or []
+            if not isinstance(block_dets, list):
+                continue
+            boxes = [self.cgrect_to_norm_xyxy(bd['boundingBox']) for bd in block_dets]
+
+            for x1, y1, x2, y2 in boxes:
+                box_center_x = ((x1 + x2) / 2) * img_width
+                if box_center_x > middle_x:
+                    right_count += 1
+                else:
+                    left_count += 1
+
+            break
+        
+        if left_count > right_count:
+            return 'right'
+        else:
+            return 'left'
+
 
     @abstractmethod
     def process_video(self):

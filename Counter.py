@@ -13,12 +13,14 @@ class Counter:
     coords_last_block = []
     target_block_registry: dict[int, Block] = {}   # track_id -> Block
     target_zone = None
+    threshold = 0
 
-    def __init__(self, target_zone, frame): 
+    def __init__(self, target_zone, frame, threshold: float = 0.25): 
         self.target_zone = target_zone
         self.set_dimensions(frame)
+        self.threshold = threshold
 
-    def has_movement(self, block: Block, threshold: float = 0.25) -> bool:
+    def has_movement(self, block: Block) -> bool:
         """Return True if the block's center has moved by at least `threshold` fraction
         of the bbox dimensions across its last-5 history.
 
@@ -50,7 +52,7 @@ class Counter:
         last_cx,  last_cy  = centers[-1]
 
         displacement = ((last_cx - first_cx) ** 2 + (last_cy - first_cy) ** 2) ** 0.5
-        return 1 >= (displacement / ref) >= threshold
+        return 3 >= (displacement / ref) >= self.threshold
     
     def update_curr_blocks_in_target(self, tracked: 'np.ndarray | None' = None):
         if tracked is not None and len(tracked) > 0:

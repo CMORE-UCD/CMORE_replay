@@ -15,7 +15,7 @@ def main():
                         help='Frames to keep a lost track alive (bytetrack only, default: 30)')
     parser.add_argument('--mode', choices=MODES, default='manual', 
                         help='Mode to enter (default: manual)')
-    parser.add_argument('--mvmt_threshold', choices=MVMT_THRESHOLD, default='0.25', 
+    parser.add_argument('--mvmt_threshold', type=float, default=0.25, 
                         help='Movement threshold to enter (default: 0.25)')
     
     # add new CLI arg 
