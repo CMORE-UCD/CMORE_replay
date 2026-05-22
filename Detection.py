@@ -32,8 +32,10 @@ class Detection:
         timeTag = Path(self.video_path).stem.split('_')[2]
         self.df = pd.read_json(f"CMORE_Results_{timeTag}.json")
         
+        ret, frame = self.cap.read()
+
         self.setup_target_zone()
-        self.counter = Counter(self.target_zone)
+        self.counter = Counter(self.target_zone, frame)
         self.setup_tracker()
     
     def setup_cap(self):

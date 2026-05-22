@@ -27,25 +27,14 @@ class DetectionAuto(Detection):
     
         prev_count = 0
         b = progressbar.ProgressBar(maxval=self.frame_count)
-        #b = progressbar.ProgressBar(maxval=500) #max_val should be frame_count, just using 500 for developing
         b.start()
-     
-        # while self.current_frame <= self.frame_count:
-        while self.current_frame < self.frame_count:
-            self.cap.set(cv.CAP_PROP_POS_FRAMES, self.current_frame)
-            ret, frame = self.cap.read()
 
-            if not ret:
-                break
-
-            time_ms = self.cap.get(cv.CAP_PROP_POS_MSEC)
-            match_idx = np.where(np.abs(timestamps - time_ms) < self.tolerance)[0]
-
-            if len(match_idx) > 0:
-                frameResult = self.df.iloc[match_idx[0]]
-                self.tracked = self.block_tracked.get(match_idx[0])
-                self.counter.update_all(frame, frameResult['state'], tracked=self.tracked)
-                self.record.update_record(frameResult['state'], time_ms, self.current_frame)
+        for idx, row in self.df.iterrows():
+            frameResult = self.df.iloc[idx]
+            time_ms = frameResult['presentationTime'] * 1000
+            self.tracked = self.block_tracked.get(idx)
+            self.counter.update_all(frameResult['state'], tracked=self.tracked)
+            self.record.update_record(frameResult['state'], time_ms, self.current_frame)
 
             self.current_frame += 1
             b.update(self.current_frame) 

@@ -14,8 +14,9 @@ class Counter:
     target_block_registry: dict[int, Block] = {}   # track_id -> Block
     target_zone = None
 
-    def __init__(self, target_zone): 
+    def __init__(self, target_zone, frame): 
         self.target_zone = target_zone
+        self.set_dimensions(frame)
 
     def has_movement(self, block: Block, threshold: float = 0.25) -> bool:
         """Return True if the block's center has moved by at least `threshold` fraction
@@ -93,7 +94,7 @@ class Counter:
         if not counter_changed:
             self.coords_last_block = None
     
-    def update_dimensions(self, frame):
+    def set_dimensions(self, frame):
         annotated = frame.copy()
         self.height, self.width, _ = annotated.shape
 
@@ -104,8 +105,7 @@ class Counter:
         if frame_state_result == 'crossedBack':
             self.crossed_back = True
 
-    def update_all(self, frame, frame_result, tracked: 'np.ndarray | None' = None):
-        self.update_dimensions(frame)
+    def update_all(self, frame_result, tracked: 'np.ndarray | None' = None):
         self.update_curr_blocks_in_target(tracked)
         self.update_prev_blocks_in_target()
         self.update_counter()

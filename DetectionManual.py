@@ -37,7 +37,7 @@ class DetectionManual(Detection):
                 print("Data frame indices: ", match_idx)
                 frameResult = self.df.iloc[match_idx[0]]
                 self.tracked = self.block_tracked.get(match_idx[0])
-                self.counter.update_all(frame, frameResult['state'], tracked=self.tracked)
+                self.counter.update_all(frameResult['state'], tracked=self.tracked)
                 frame = self.visualize_frame(frame, frameResult, tracked=self.tracked, counter=self.counter, target_zone=self.target_zone)
                 state_text = f"State: {frameResult['state']}"
 
