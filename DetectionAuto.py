@@ -7,27 +7,31 @@ from pathlib import Path
 
 from Block import Block
 from Counter import Counter
+from DetectionRecord import DetectionRecord
 from Config import *
 import progressbar
 import time
+
+record = None
 
 
 class DetectionAuto(Detection):
 
     def __init__(self, args):
         super().__init__(args)
+        self.record = DetectionRecord(self.counter)
 
     def process_video(self):  
         output = []
         timestamps = self.df['presentationTime'].to_numpy() * 1000.0 
     
         prev_count = 0
-        # b = progressbar.ProgressBar(maxval=self.frame_count)
-        b = progressbar.ProgressBar(maxval=500) #max_val should be frame_count, just using 500 for developing
+        b = progressbar.ProgressBar(maxval=self.frame_count)
+        #b = progressbar.ProgressBar(maxval=500) #max_val should be frame_count, just using 500 for developing
         b.start()
      
         # while self.current_frame <= self.frame_count:
-        while self.current_frame < 500:
+        while self.current_frame < self.frame_count:
             self.cap.set(cv.CAP_PROP_POS_FRAMES, self.current_frame)
             ret, frame = self.cap.read()
 
@@ -41,26 +45,17 @@ class DetectionAuto(Detection):
                 frameResult = self.df.iloc[match_idx[0]]
                 self.tracked = self.block_tracked.get(match_idx[0])
                 self.counter.update_all(frame, frameResult['state'], tracked=self.tracked)
-
-                if self.counter.counter > prev_count:
-                    prev_count += 1
-                    curr_output = { #TO DO: figure out headers, reference google drive + old CMORE repo
-                        'count_time': f"{time_ms}",
-                        'count_frame': f"{self.current_frame}",
-                        'current_count': f"{self.counter.counter}",
-                        'valid_count': 'tbd'
-                    }
-                    output.append(curr_output)
+                self.record.update_record(frameResult['state'], time_ms, self.current_frame)
 
             self.current_frame += 1
             b.update(self.current_frame) 
 
         timeTag = Path(self.video_path).stem.split('_')[2]
         with open(f'CMORE_Test_Results_{timeTag}.csv', 'w', newline='') as csvfile:
-            fieldnames = ['count_time', 'count_frame', 'current_count', 'valid_count']
+            fieldnames = self.record.keys
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(output)
+            writer.writerows(self.record.total_record)
             
         b.finish()
 
