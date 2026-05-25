@@ -18,7 +18,8 @@ class Detection:
     cap = None
     target_zone = None
     tracker = None
-    block_tracked = {}  # df row index -> np.ndarray (n, 8) or None
+    block_tracked = None  # df row index -> np.ndarray (n, 8) or None
+    tracker_head = -1     # last df row index fed to tracker
     current_frame = 0
     tolerance = 0
     frame_count = 0
@@ -26,17 +27,19 @@ class Detection:
     def __init__(self, args):
         self.args = args
         self.video_path = args.video_path
+        self.block_tracked = {}
+        self.tracker_head = -1
         self.setup_cap()
 
         # Open up the results
         timeTag = Path(self.video_path).stem.split('_')[2]
         self.df = pd.read_json(f"CMORE_Results_{timeTag}.json")
-        
+
         ret, frame = self.cap.read()
 
         self.setup_target_zone()
         self.counter = Counter(self.target_zone, frame, args.mvmt_threshold)
-        self.setup_tracker()
+        self.tracker = self.make_tracker(self.args.tracker, self.args.track_buffer)
     
     def setup_cap(self):
         self.cap = cv.VideoCapture(self.video_path)
@@ -56,11 +59,13 @@ class Detection:
         img_width = int(self.cap.get(cv.CAP_PROP_FRAME_WIDTH))
         self.target_zone = self.compute_target_zone(self.df, img_height, img_width)
 
-    def setup_tracker(self):
-        self.tracker = self.make_tracker(self.args.tracker, self.args.track_buffer)
+    def _advance_tracker_to(self, target_idx: int):
+        """Feed df rows (tracker_head+1 .. target_idx) to the tracker, caching results."""
+        if target_idx <= self.tracker_head:
+            return
         dummy_frame = np.zeros((1, 1, 3), dtype=np.uint8)
-
-        for idx, row in self.df.iterrows():
+        for idx in range(self.tracker_head + 1, target_idx + 1):
+            row = self.df.iloc[idx]
             block_dets = row.get('blockDetections') or []
             if not isinstance(block_dets, list):
                 block_dets = []
@@ -74,6 +79,11 @@ class Detection:
                 self.block_tracked[idx] = self.tracker.update(dets, dummy_frame)
             else:
                 self.block_tracked[idx] = self.tracker.update(np.empty((0, 6), dtype=np.float32), dummy_frame)
+        self.tracker_head = target_idx
+
+    def setup_tracker(self):
+        """Pre-compute tracker results for all frames (used by auto mode)."""
+        self._advance_tracker_to(len(self.df) - 1)
 
     def make_tracker(self, name: str, track_buffer: int = 30):
         """Instantiate a boxmot motion-only tracker by name."""

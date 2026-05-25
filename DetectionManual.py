@@ -36,6 +36,7 @@ class DetectionManual(Detection):
             if len(match_idx) > 0:
                 print("Data frame indices: ", match_idx)
                 frameResult = self.df.iloc[match_idx[0]]
+                self._advance_tracker_to(match_idx[0])
                 self.tracked = self.block_tracked.get(match_idx[0])
                 self.counter.update_all(frameResult['state'], tracked=self.tracked)
                 frame = self.visualize_frame(frame, frameResult, tracked=self.tracked, counter=self.counter, target_zone=self.target_zone)

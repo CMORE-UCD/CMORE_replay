@@ -19,6 +19,7 @@ class DetectionAuto(Detection):
 
     def __init__(self, args):
         super().__init__(args)
+        self.setup_tracker()
         self.record = DetectionRecord(self.counter)
 
     def process_video(self):  
