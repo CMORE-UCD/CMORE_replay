@@ -22,7 +22,8 @@ class DetectionManual(Detection):
        
         while True:
             self.cap.set(cv.CAP_PROP_POS_FRAMES, self.current_frame)
-            ret, frame = self.cap.read()
+            ret, self.frame = self.cap.read()
+            frame = self.frame
 
             if not ret:
                 break

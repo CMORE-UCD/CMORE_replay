@@ -15,7 +15,7 @@ class Detection:
     video_path = None
     df = None
     counter = None
-    cap = None
+    cap: 'cv.VideoCapture | None' = None
     target_zone = None
     tracker = None
     block_tracked = None  # df row index -> np.ndarray (n, 8) or None
@@ -23,6 +23,9 @@ class Detection:
     current_frame = 0
     tolerance = 0
     frame_count = 0
+    img_width = 0
+    img_height = 0
+    frame = None          # current BGR video frame
 
     def __init__(self, args):
         self.args = args
@@ -35,10 +38,10 @@ class Detection:
         timeTag = Path(self.video_path).stem.split('_')[2]
         self.df = pd.read_json(f"CMORE_Results_{timeTag}.json")
 
-        ret, frame = self.cap.read()
+        ret, self.frame = self.cap.read()
 
         self.setup_target_zone()
-        self.counter = Counter(self.target_zone, frame, args.mvmt_threshold)
+        self.counter = Counter(self.target_zone, self.frame, args.mvmt_threshold)
         self.tracker = self.make_tracker(self.args.tracker, self.args.track_buffer)
     
     def setup_cap(self):
@@ -52,6 +55,8 @@ class Detection:
         self.tolerance = 10 # 1000 / fps
         print(f"Using time tolerance of {self.tolerance:.3f}ms")
         self.frame_count = int(self.cap.get(cv.CAP_PROP_FRAME_COUNT))
+        self.img_width = int(self.cap.get(cv.CAP_PROP_FRAME_WIDTH))
+        self.img_height = int(self.cap.get(cv.CAP_PROP_FRAME_HEIGHT))
         print(f"Video loaded. FPS: {fps}, Total frames: {self.frame_count}")
 
     def setup_target_zone(self):
@@ -63,7 +68,8 @@ class Detection:
         """Feed df rows (tracker_head+1 .. target_idx) to the tracker, caching results."""
         if target_idx <= self.tracker_head:
             return
-        dummy_frame = np.zeros((1, 1, 3), dtype=np.uint8)
+        w, h = self.img_width, self.img_height
+        frame = self.frame if self.frame is not None else np.zeros((h, w, 3), dtype=np.uint8)
         for idx in range(self.tracker_head + 1, target_idx + 1):
             row = self.df.iloc[idx]
             block_dets = row.get('blockDetections') or []
@@ -73,12 +79,19 @@ class Detection:
             valid = [(b, bd) for b, bd in zip(boxes, block_dets) if b is not None]
             if valid:
                 xyxy = np.array([b for b, _ in valid], dtype=np.float32)
+                xyxy[:, [0, 2]] *= w
+                xyxy[:, [1, 3]] *= h
                 conf = np.array([float(bd.get('confidence', 1.0)) for _, bd in valid], dtype=np.float32)
                 cls = np.zeros(len(valid), dtype=np.float32)
                 dets = np.column_stack([xyxy, conf, cls])
-                self.block_tracked[idx] = self.tracker.update(dets, dummy_frame)
+                result = self.tracker.update(dets, frame)
+                if result is not None and len(result) > 0:
+                    result = result.astype(np.float32).copy()
+                    result[:, [0, 2]] /= w
+                    result[:, [1, 3]] /= h
+                self.block_tracked[idx] = result
             else:
-                self.block_tracked[idx] = self.tracker.update(np.empty((0, 6), dtype=np.float32), dummy_frame)
+                self.block_tracked[idx] = self.tracker.update(np.empty((0, 6), dtype=np.float32), frame)
         self.tracker_head = target_idx
 
     def setup_tracker(self):
