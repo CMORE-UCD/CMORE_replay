@@ -6,7 +6,7 @@ FONT_SIZE = 1
 FONT_THICKNESS = 1
 HANDEDNESS_TEXT_COLOR = (88, 205, 54) # vibrant green
 TRACKER_COLOR = (255, 255, 0)  # cyan for tracker boxes
-COUNTER_COLOR = (138,43,226) # violet for counting boxes
+COUNTER_COLOR = (255, 0, 0) # red
 
 # Mapping from Vision framework joint names to MediaPipe landmark indices
 VISION_TO_MEDIAPIPE = {

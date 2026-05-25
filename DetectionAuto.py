@@ -1,18 +1,11 @@
-from Detection import Detection
-import cv2 as cv
 import csv
-import pandas as pd
-import numpy as np
+import cv2 as cv
 from pathlib import Path
 
-from Block import Block
-from Counter import Counter
-from DetectionRecord import DetectionRecord
-from Config import *
 import progressbar
-import time
 
-record = None
+from Detection import Detection
+from DetectionRecord import DetectionRecord
 
 
 class DetectionAuto(Detection):
@@ -22,32 +15,23 @@ class DetectionAuto(Detection):
         self.setup_tracker()
         self.record = DetectionRecord(self.counter)
 
-    def process_video(self):  
-        output = []
-        timestamps = self.df['presentationTime'].to_numpy() * 1000.0 
-    
-        prev_count = 0
-        b = progressbar.ProgressBar(maxval=self.frame_count)
-        b.start()
+    def process_video(self):
+        b = progressbar.ProgressBar(maxval=len(self.df)).start()
 
         for idx, row in self.df.iterrows():
-            frameResult = self.df.iloc[idx]
-            time_ms = frameResult['presentationTime'] * 1000
-            self.tracked = self.block_tracked.get(idx)
-            self.counter.update_all(frameResult['state'], tracked=self.tracked)
-            self.record.update_record(frameResult['state'], time_ms, self.current_frame)
-
+            time_ms = row['presentationTime'] * 1000
+            tracked = self.block_tracked.get(idx)
+            self.counter.update_all(row['state'], tracked=tracked)
+            self.record.update_record(row['state'], time_ms, self.current_frame)
             self.current_frame += 1
-            b.update(self.current_frame) 
+            b.update(self.current_frame)
 
-        timeTag = Path(self.video_path).stem.split('_')[2]
-        with open(f'CMORE_Test_Results_{timeTag}_{self.args.mvmt_threshold}.csv', 'w', newline='') as csvfile:
-            fieldnames = self.record.keys
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(self.record.total_record)
-            
         b.finish()
 
+        timeTag = Path(self.video_path).stem.split('_')[2]
+        with open(f'CMORE_Test_Results_{timeTag}_{self.args.mvmt_threshold}.csv', 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=self.record.keys)
+            writer.writeheader()
+            writer.writerows(self.record.total_record)
+
         self.cap.release()
-        cv.destroyAllWindows()

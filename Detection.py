@@ -1,71 +1,62 @@
-from abc import ABC, abstractmethod
 import sys
 import cv2 as cv
-import pandas as pd
 import numpy as np
-from pathlib import Path
+import pandas as pd
 import boxmot
+from abc import abstractmethod
+from pathlib import Path
 
-from Block import Block
 from Config import *
 from Counter import Counter
 
+
 class Detection:
-    args = None
-    video_path = None
-    df = None
-    counter = None
-    cap: 'cv.VideoCapture | None' = None
-    target_zone = None
-    tracker = None
-    block_tracked = None  # df row index -> np.ndarray (n, 8) or None
-    tracker_head = -1     # last df row index fed to tracker
-    current_frame = 0
-    tolerance = 0
-    frame_count = 0
-    img_width = 0
-    img_height = 0
-    frame = None          # current BGR video frame
 
     def __init__(self, args):
         self.args = args
         self.video_path = args.video_path
-        self.block_tracked = {}
+        self.block_tracked: dict[int, np.ndarray | None] = {}
         self.tracker_head = -1
-        self.setup_cap()
+        self.frame: np.ndarray | None = None
 
-        # Open up the results
+        self._setup_cap()
+
         timeTag = Path(self.video_path).stem.split('_')[2]
         self.df = pd.read_json(f"CMORE_Results_{timeTag}.json")
 
-        ret, self.frame = self.cap.read()
+        _, self.frame = self.cap.read()
 
-        self.setup_target_zone()
+        self.target_zone = self._compute_target_zone()
         self.counter = Counter(self.target_zone, self.frame, args.mvmt_threshold)
-        self.tracker = self.make_tracker(self.args.tracker, self.args.track_buffer)
-    
-    def setup_cap(self):
-        self.cap = cv.VideoCapture(self.video_path)
+        self.tracker = self._make_tracker(args.tracker, args.track_buffer)
 
+    def _setup_cap(self):
+        self.cap: cv.VideoCapture = cv.VideoCapture(self.video_path)
         if not self.cap.isOpened():
             print("Error: Could not open video file")
             sys.exit(1)
 
         fps = self.cap.get(cv.CAP_PROP_FPS)
-        self.tolerance = 10 # 1000 / fps
-        print(f"Using time tolerance of {self.tolerance:.3f}ms")
+        self.tolerance = 10
         self.frame_count = int(self.cap.get(cv.CAP_PROP_FRAME_COUNT))
         self.img_width = int(self.cap.get(cv.CAP_PROP_FRAME_WIDTH))
         self.img_height = int(self.cap.get(cv.CAP_PROP_FRAME_HEIGHT))
+        self.current_frame = 0
         print(f"Video loaded. FPS: {fps}, Total frames: {self.frame_count}")
 
-    def setup_target_zone(self):
-        img_height = int(self.cap.get(cv.CAP_PROP_FRAME_HEIGHT))
-        img_width = int(self.cap.get(cv.CAP_PROP_FRAME_WIDTH))
-        self.target_zone = self.compute_target_zone(self.df, img_height, img_width)
+    def _make_tracker(self, name: str, track_buffer: int = 30):
+        options = {
+            'bytetrack':  lambda: boxmot.ByteTrack(track_buffer=track_buffer),
+            'ocsort':     lambda: boxmot.OcSort(),
+            'sfsort':     lambda: boxmot.SFSORT(),
+            'boosttrack': lambda: boxmot.BoostTrack(),
+        }
+        if name not in options:
+            raise ValueError(f"Unknown tracker '{name}'. Choose from: {MOTION_TRACKERS}")
+        return options[name]()
 
     def _advance_tracker_to(self, target_idx: int):
-        """Feed df rows (tracker_head+1 .. target_idx) to the tracker, caching results."""
+        """Feed df rows tracker_head+1..target_idx into the tracker, caching results."""
         if target_idx <= self.tracker_head:
             return
         w, h = self.img_width, self.img_height
@@ -75,7 +66,7 @@ class Detection:
             block_dets = row.get('blockDetections') or []
             if not isinstance(block_dets, list):
                 block_dets = []
-            boxes = [self.cgrect_to_norm_xyxy(bd['boundingBox']) for bd in block_dets]
+            boxes = [self._cgrect_to_norm_xyxy(bd['boundingBox']) for bd in block_dets]
             valid = [(b, bd) for b, bd in zip(boxes, block_dets) if b is not None]
             if valid:
                 xyxy = np.array([b for b, _ in valid], dtype=np.float32)
@@ -95,82 +86,40 @@ class Detection:
         self.tracker_head = target_idx
 
     def setup_tracker(self):
-        """Pre-compute tracker results for all frames (used by auto mode)."""
         self._advance_tracker_to(len(self.df) - 1)
 
-    def make_tracker(self, name: str, track_buffer: int = 30):
-        """Instantiate a boxmot motion-only tracker by name."""
-        if name == 'bytetrack':
-            return boxmot.ByteTrack(track_buffer=track_buffer)
-        elif name == 'ocsort':
-            return boxmot.OcSort()
-        elif name == 'sfsort':
-            return boxmot.SFSORT()
-        elif name == 'boosttrack':
-            return boxmot.BoostTrack()
-        else:
-            raise ValueError(f"Unknown tracker '{name}'. Choose from: {MOTION_TRACKERS}")
-
-    def cgrect_to_norm_xyxy(self, detection):
-        """Convert a Vision cgRect dict to normalized [x1, y1, x2, y2] (top-left origin)."""
+    def _cgrect_to_norm_xyxy(self, detection) -> list | None:
+        """Convert a Vision cgRect to normalized [x1, y1, x2, y2] with top-left origin."""
         rect = detection.get('cgRect')
-        if rect and len(rect) == 2:
-            (x_norm, y_norm), (w_norm, h_norm) = rect
-            x1 = x_norm
-            x2 = x_norm + w_norm
-            y1 = 1.0 - (y_norm + h_norm)  # flip y: Vision bottom-left → top-left
-            y2 = 1.0 - y_norm
-            if w_norm > 0 and h_norm > 0:
-                return [x1, y1, x2, y2]
-        return None
+        if not rect or len(rect) != 2:
+            return None
+        (x, y), (w, h) = rect
+        if w <= 0 or h <= 0:
+            return None
+        return [x, 1.0 - (y + h), x + w, 1.0 - y]
 
-    def compute_target_zone(self, df, img_height, img_width):
-        """Computes the target zone, a trapezoidal shape, from keypoints. 
-
-        The returned lines are always stored globally; call this once when the box is
-        first detected.
-
-        Args:
-            box_detection: dict with 'keypoints' list; each keypoint has
-                        'position' [x, y] in pixels (Vision y-axis, not flipped yet)
-                        and optional 'confidence'.
-            img_height: frame dimensions in pixels.
-
-        Returns:
-            (top_left, top_right): two (x, y) pixel tuples representing the delimiter
-                                segment, or None if fewer than 3 keypoints exist.
-        """
+    def _compute_target_zone(self) -> dict | None:
+        """Build the trapezoidal target zone from the first valid box detection."""
         box_detection = None
-
-        # find first valid box detection
-        for idx in range(0, len(df)):
-            row = df.iloc[idx]
-            box_detection = row.get('boxDetection')  # or row['boxDetection'] if you're sure it exists
-
-            # Adjust validity check to match your data type:
-            if box_detection is None or (hasattr(box_detection, '__len__') and len(box_detection) == 0):
-                continue  # skip empty/null detections
-
-            break
-
-        keypoints = box_detection.get('keypoints', [])
-        if len(keypoints) < 3:
+        for _, row in self.df.iterrows():
+            bd = row.get('boxDetection')
+            if bd:
+                box_detection = bd
+                break
+        if box_detection is None:
             return None
 
-        # Flip y to screen coordinates (same transform used during drawing)
-        pts = []
-        for kp in keypoints:
-            x, y = kp.get('position', [0, 0])
-            y_screen = img_height - y
-            pts.append((x, y_screen))
+        keypoints = box_detection.get('keypoints', [])
+        if len(keypoints) < 10:
+            return None
 
-        
+        pts = [(kp.get('position', [0, 0])[0], self.img_height - kp.get('position', [0, 0])[1])
+               for kp in keypoints]
+
         top_middle, top_left, top_right = pts[6], pts[8], pts[9]
         bottom_left, bottom_right = pts[0], pts[4]
 
-        # Split the bottom segment at the x-coordinate of the top point
         split_x = top_middle[0]
-        # Linearly interpolate y on the segment top_left→top_right at x=split_x
         if top_right[0] != top_left[0]:
             t = (split_x - top_left[0]) / (top_right[0] - top_left[0])
             split_y = top_left[1] + t * (top_right[1] - top_left[1])
@@ -178,48 +127,36 @@ class Detection:
             split_y = (top_left[1] + top_right[1]) / 2.0
         split_pt = (split_x, split_y)
 
-        # Choose the half according to target_side
-        # choose side
-        if self.target_side(split_x, df, img_width) == 'right':
-            top_left = split_pt
-            bottom_left = pts[2]
+        if self._target_side(split_x) == 'right':
+            top_left, bottom_left = split_pt, pts[2]
         else:
-            top_right = split_pt
-            bottom_right = pts[2]
+            top_right, bottom_right = split_pt, pts[2]
 
         return {
-            "top_left" : top_left,
-            "bottom_left" : bottom_left,
-            "top_right" : top_right,
-            "bottom_right" : bottom_right
+            "top_left": top_left,
+            "bottom_left": bottom_left,
+            "top_right": top_right,
+            "bottom_right": bottom_right,
         }
 
-    def target_side(self, middle_x, df, img_width):
-        left_count = 0
-        right_count = 0
-
-        # up till first valid block detections
-
-        for idx, row in self.df.iterrows():
+    def _target_side(self, middle_x: float) -> str:
+        """Return 'left' or 'right' based on where the first-frame blocks cluster."""
+        left_count = right_count = 0
+        for _, row in self.df.iterrows():
             block_dets = row.get('blockDetections') or []
             if not isinstance(block_dets, list):
                 continue
-            boxes = [self.cgrect_to_norm_xyxy(bd['boundingBox']) for bd in block_dets]
-
-            for x1, y1, x2, y2 in boxes:
-                box_center_x = ((x1 + x2) / 2) * img_width
-                if box_center_x > middle_x:
+            for bd in block_dets:
+                box = self._cgrect_to_norm_xyxy(bd['boundingBox'])
+                if box is None:
+                    continue
+                center_x = ((box[0] + box[2]) / 2) * self.img_width
+                if center_x > middle_x:
                     right_count += 1
                 else:
                     left_count += 1
-
             break
-        
-        if left_count > right_count:
-            return 'right'
-        else:
-            return 'left'
-
+        return 'right' if left_count > right_count else 'left'
 
     @abstractmethod
     def process_video(self):
