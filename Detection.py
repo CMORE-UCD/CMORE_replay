@@ -46,10 +46,10 @@ class Detection:
 
     def _make_tracker(self, name: str, track_buffer: int = 30):
         options = {
-            'bytetrack':  lambda: boxmot.ByteTrack(track_buffer=track_buffer),
-            'ocsort':     lambda: boxmot.OcSort(),
-            'sfsort':     lambda: boxmot.SFSORT(),
-            'boosttrack': lambda: boxmot.BoostTrack(),
+            'bytetrack':  lambda: boxmot.ByteTrack(track_buffer=track_buffer, min_hits=1),
+            'ocsort':     lambda: boxmot.OcSort(min_hits=1),
+            'sfsort':     lambda: boxmot.SFSORT(min_hits=1),
+            'boosttrack': lambda: boxmot.BoostTrack(min_hits=1),
         }
         if name not in options:
             raise ValueError(f"Unknown tracker '{name}'. Choose from: {MOTION_TRACKERS}")
