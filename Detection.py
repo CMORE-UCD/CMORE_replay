@@ -137,10 +137,10 @@ class Detection:
         # Flip y to screen coordinates (same transform used during drawing)
         pts = []
         for kp in keypoints:
-            x, y = kp.get('position', [0, 0])
-            y_screen = img_height - y
-            pts.append((x, y_screen))
-
+            x, y = kp.get('location', {}).get('cgPoint', [0, 0])
+            x_screen = x * img_width
+            y_screen = (1 - y) * img_height
+            pts.append((x_screen, y_screen))
         
         top_middle, top_left, top_right = pts[6], pts[8], pts[9]
         bottom_left, bottom_right = pts[0], pts[4]
@@ -164,6 +164,8 @@ class Detection:
             top_right = split_pt
             bottom_right = pts[2]
 
+        print(f"box detection points: {top_left}, {bottom_left}, {top_right}, {bottom_right}.")
+        
         return {
             "top_left" : top_left,
             "bottom_left" : bottom_left,

@@ -27,7 +27,7 @@ class DetectionRecord:
     def update_record(self, curr_state, time_ms, current_frame):
         #states: free, detecting, crossed, crossedBack
         # if end of an attempt, add to list and clear current entry
-        if self.prev_state is not None and self.prev_state == 'crossedBack' and curr_state == 'free':
+        if self.prev_state is not None and self.prev_state == 'crossed' and curr_state == 'notCrossed':
             self.end_and_add_entry(time_ms, current_frame)
 
         self.update_state(time_ms, current_frame, curr_state)
@@ -49,7 +49,7 @@ class DetectionRecord:
                 self.current_record['attempt_start_time'] = time_ms
                 self.current_record['attempt_start_frame'] = current_frame
 
-            if self.prev_state == 'detecting' and curr_state == 'crossed':
+            if self.prev_state == 'notCrossed' and curr_state == 'crossed':
                 self.current_record['cross_time'] = time_ms
                 self.current_record['cross_frame'] = current_frame
         

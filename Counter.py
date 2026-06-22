@@ -7,6 +7,7 @@ class Counter:
     height = 0
     width = 0
     active_counting_state = False
+    prev_state_result = None
     crossed_back = False
     counted_ids = set()
     curr_target_tids = set()
@@ -104,8 +105,10 @@ class Counter:
         if self.active_counting_state and self.crossed_back and frame_state_result == 'crossed':
             self.active_counting_state = False
 
-        if frame_state_result == 'crossedBack':
+        if self.prev_state_result and self.prev_state_result == 'notCrossed' and frame_state_result == 'crossed':
             self.crossed_back = True
+
+        self.prev_state_result = frame_state_result
 
     def update_all(self, frame_result, tracked: 'np.ndarray | None' = None):
         self.update_curr_blocks_in_target(tracked)
