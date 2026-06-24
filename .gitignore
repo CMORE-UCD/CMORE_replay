@@ -15,3 +15,5 @@ wheels/
 *.MOV
 *.mov
 *.json
+*.zip
+*.csv
